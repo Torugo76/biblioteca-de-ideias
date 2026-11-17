@@ -271,6 +271,14 @@ class SlowService:
         return "abc"
 
 
+class FlakyService(SlowService):
+    def fetch(self):
+        self.fetch_count += 1
+        if self.fetch_count == 1:
+            raise RuntimeError("gh" + "p_credencial-nao-deve-vazar")
+        return CommandResult(0, "", "")
+
+
 class CoordinatorResponsivenessTest(unittest.TestCase):
     @patch("biblioteca_ideias.git_sync.detect_github_cli", return_value=(False, None))
     def test_fetch_requests_coalesce_and_caller_never_blocks(self, _auth) -> None:
@@ -286,6 +294,24 @@ class CoordinatorResponsivenessTest(unittest.TestCase):
             self.assertTrue(coordinator.wait_for_idle())
             self.assertEqual(service.fetch_count, 1)
             self.assertEqual(coordinator.state, STATE_SYNCED)
+        finally:
+            coordinator.close()
+
+    @patch("biblioteca_ideias.git_sync.detect_github_cli", return_value=(False, None))
+    def test_worker_survives_exception_releases_fetch_and_processes_next_task(self, _auth) -> None:
+        service = FlakyService()
+        coordinator = SyncCoordinator(Path("/tmp"), auto_sync=False, service=service)
+        try:
+            coordinator.request_sync()
+            self.assertTrue(coordinator.wait_for_idle())
+            self.assertEqual(coordinator.state, STATE_ERROR)
+            self.assertTrue(coordinator._worker.is_alive())
+
+            coordinator.request_sync()
+            self.assertTrue(coordinator.wait_for_idle())
+            self.assertEqual(service.fetch_count, 2)
+            self.assertEqual(coordinator.state, STATE_SYNCED)
+            self.assertTrue(coordinator._worker.is_alive())
         finally:
             coordinator.close()
 
@@ -315,6 +341,17 @@ class GitServiceSafetyTest(unittest.TestCase):
     def test_rejected_push_is_a_conflict(self) -> None:
         result = CommandResult(1, "", "! [rejected] main -> main (non-fast-forward)")
         self.assertEqual(classify_failure(result), STATE_CONFLICT)
+
+    @patch("biblioteca_ideias.git_sync.subprocess.run")
+    def test_spawn_exception_is_generic_and_never_leaks_credentials(self, run) -> None:
+        credential = "gh" + "s_credencial-nao-deve-vazar"
+        run.side_effect = OSError(f"falha contendo {credential}")
+        service = GitService(Path("/tmp"))
+        service.git = "/usr/bin/git"
+        result = service.run(("status", "--porcelain=v2", "-z"))
+        self.assertEqual(result.returncode, 126)
+        self.assertNotIn(credential, result.stderr)
+        self.assertEqual(result.stderr, "falha ao iniciar operação Git")
 
 
 if __name__ == "__main__":

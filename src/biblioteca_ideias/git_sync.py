@@ -109,6 +109,8 @@ class GitService:
             )
         except subprocess.TimeoutExpired:
             return CommandResult(124, "", "tempo limite excedido")
+        except (OSError, subprocess.SubprocessError):
+            return CommandResult(126, "", "falha ao iniciar operação Git")
         return CommandResult(
             completed.returncode,
             sanitize_output(completed.stdout.decode("utf-8", "replace")),
@@ -302,19 +304,22 @@ class SyncCoordinator(QObject):
             try:
                 if action == "stop":
                     return
-                if action == "barrier":
-                    payload.set()  # type: ignore[union-attr]
-                elif action == "auth":
+                if action == "auth":
                     authenticated, username = detect_github_cli()
                     self.authChanged.emit(authenticated, username or "")
                 elif action == "fetch":
                     self._sync()
-                    with self._fetch_lock:
-                        self._fetch_pending = False
                 elif action == "save":
                     paths, message = payload  # type: ignore[misc]
                     self._save(paths, message)
+            except Exception:
+                self._set_state(STATE_ERROR)
             finally:
+                if action == "fetch":
+                    with self._fetch_lock:
+                        self._fetch_pending = False
+                if action == "barrier" and isinstance(payload, threading.Event):
+                    payload.set()
                 self._queue.task_done()
 
     def _preflight(self) -> tuple[list[str] | None, str | None]:
