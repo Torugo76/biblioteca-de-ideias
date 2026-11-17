@@ -311,7 +311,6 @@ Kirigami.ApplicationWindow {
         modal: true
         anchors.centerIn: parent
         width: Math.min(680, root.width - 48)
-        standardButtons: Controls.Dialog.Close
         ColumnLayout {
             anchors.fill: parent
             spacing: Kirigami.Units.largeSpacing
@@ -333,6 +332,11 @@ Kirigami.ApplicationWindow {
                 text: "A localização do cofre é fixa neste incremento."
                 wrapMode: Text.WordWrap
                 color: Kirigami.Theme.disabledTextColor
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                Controls.Button { text: "Fechar"; onClicked: settingsDialog.close() }
             }
         }
     }
