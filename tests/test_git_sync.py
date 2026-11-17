@@ -18,6 +18,7 @@ from biblioteca_ideias.git_sync import (
     classify_failure,
     detect_github_cli,
     sanitize_output,
+    validate_github_repository_metadata,
 )
 
 
@@ -63,7 +64,11 @@ class GitIntegrationTest(unittest.TestCase):
         git(repo, "config", "user.email", "teste@example.invalid")
 
     def coordinator(self, repo: Path, timeout: float = 5) -> SyncCoordinator:
-        return SyncCoordinator(repo, auto_sync=False, service=GitService(repo, timeout=timeout))
+        return SyncCoordinator(
+            repo,
+            auto_sync=False,
+            service=GitService(repo, timeout=timeout, destination_validator=lambda: True),
+        )
 
     def test_manual_sync_fast_forwards_clean_clone(self) -> None:
         (self.b / "remota.md").write_text("remota\n", encoding="utf-8")
@@ -77,6 +82,32 @@ class GitIntegrationTest(unittest.TestCase):
             self.assertEqual(coordinator.state, STATE_SYNCED)
             self.assertTrue((self.a / "remota.md").exists())
             self.assertEqual(git(self.a, "rev-parse", "HEAD"), git(self.b, "rev-parse", "HEAD"))
+        finally:
+            coordinator.close()
+
+    def test_concurrent_edit_during_fetch_is_preserved_and_ff_is_refused(self) -> None:
+        (self.b / "ideia.md").write_text("remota\n", encoding="utf-8")
+        git(self.b, "add", "--", "ideia.md")
+        git(self.b, "commit", "-m", "remota")
+        git(self.b, "push", "origin", "main")
+        original_head = git(self.a, "rev-parse", "HEAD")
+
+        class EditingFetchService(GitService):
+            def fetch(inner_self):
+                result = super().fetch()
+                (self.a / "ideia.md").write_bytes(b"edicao externa preservada\n")
+                return result
+
+        service = EditingFetchService(
+            self.a, destination_validator=lambda: True
+        )
+        coordinator = SyncCoordinator(self.a, auto_sync=False, service=service)
+        try:
+            coordinator.request_sync()
+            self.assertTrue(coordinator.wait_for_idle())
+            self.assertEqual(coordinator.state, STATE_CONFLICT)
+            self.assertEqual((self.a / "ideia.md").read_bytes(), b"edicao externa preservada\n")
+            self.assertEqual(git(self.a, "rev-parse", "HEAD"), original_head)
         finally:
             coordinator.close()
 
@@ -141,6 +172,30 @@ class GitIntegrationTest(unittest.TestCase):
             self.assertTrue(coordinator.wait_for_idle())
             self.assertEqual(coordinator.state, STATE_CONFLICT)
             self.assertEqual(set(git(self.a, "diff", "--cached", "--name-only").splitlines()), {"externo.txt"})
+        finally:
+            coordinator.close()
+
+    def test_failed_commit_unstages_only_app_paths_and_preserves_external_staging(self) -> None:
+        (self.a / "externo.txt").write_text("externo\n", encoding="utf-8")
+        (self.a / "ideia.md").write_text("local preservado\n", encoding="utf-8")
+
+        class FailingCommitService(GitService):
+            def commit(inner_self, message):
+                git(self.a, "add", "--", "externo.txt")
+                return CommandResult(1, "", "falha simulada")
+
+        service = FailingCommitService(self.a, destination_validator=lambda: True)
+        coordinator = SyncCoordinator(self.a, auto_sync=False, service=service)
+        try:
+            coordinator.request_save(("ideia.md",), "ideia: falhar")
+            self.assertTrue(coordinator.wait_for_idle())
+            self.assertEqual(coordinator.state, STATE_ERROR)
+            self.assertEqual(
+                set(git(self.a, "diff", "--cached", "--name-only").splitlines()),
+                {"externo.txt"},
+            )
+            self.assertEqual((self.a / "ideia.md").read_text(encoding="utf-8"), "local preservado\n")
+            self.assertIn("ideia.md", git(self.a, "diff", "--name-only").splitlines())
         finally:
             coordinator.close()
 
@@ -352,6 +407,41 @@ class GitServiceSafetyTest(unittest.TestCase):
         self.assertEqual(result.returncode, 126)
         self.assertNotIn(credential, result.stderr)
         self.assertEqual(result.stderr, "falha ao iniciar operação Git")
+
+    @patch("biblioteca_ideias.git_sync.validate_github_repository_metadata", return_value=True)
+    def test_destination_validation_rejects_malicious_swap_after_valid_session(self, metadata) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git(repo, "init", "--initial-branch=main")
+            git(repo, "remote", "add", "origin", "https://github.com/Torugo76/biblioteca-de-ideias-cofre.git")
+            service = GitService(repo)
+            self.assertTrue(service.validate_destination())
+            self.assertEqual(metadata.call_count, 1)
+            git(repo, "remote", "set-url", "origin", "https://github.com/atacante/cofre.git")
+            result = service.fetch()
+            self.assertEqual(result.returncode, 125)
+            self.assertEqual(metadata.call_count, 1)
+
+    @patch("biblioteca_ideias.git_sync.validate_github_repository_metadata", return_value=True)
+    def test_destination_validation_rejects_userinfo_and_non_main_branch(self, _metadata) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git(repo, "init", "--initial-branch=outra")
+            git(repo, "remote", "add", "origin", "https://usuario@github.com/Torugo76/biblioteca-de-ideias-cofre.git")
+            self.assertFalse(GitService(repo).validate_destination())
+
+    @patch("biblioteca_ideias.git_sync.shutil.which", return_value="/usr/bin/gh")
+    @patch("biblioteca_ideias.git_sync.subprocess.run")
+    def test_public_or_wrong_github_repository_metadata_is_rejected(self, run, _which) -> None:
+        for metadata in (
+            b'{"nameWithOwner":"Torugo76/biblioteca-de-ideias-cofre","visibility":"PUBLIC"}',
+            b'{"nameWithOwner":"outro/cofre","visibility":"PRIVATE"}',
+        ):
+            with self.subTest(metadata=metadata):
+                run.return_value = subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout=metadata, stderr=b""
+                )
+                self.assertFalse(validate_github_repository_metadata())
 
 
 if __name__ == "__main__":

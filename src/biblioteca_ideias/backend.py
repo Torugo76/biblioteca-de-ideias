@@ -6,11 +6,11 @@ import html
 import os
 import re
 
-from PySide6.QtCore import QObject, Property, QLockFile, QStandardPaths, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, Property, QLockFile, QStandardPaths, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 
 from .storage import COLUMNS, INITIAL_BODY, MarkdownStore, StorageError
-from .git_sync import STATE_LOCAL, SyncCoordinator
+from .git_sync import STATE_ERROR, STATE_LOCAL, SyncCoordinator
 
 
 APP_ID = "br.com.torugo.bibliotecadeideias"
@@ -38,7 +38,12 @@ class Backend(QObject):
     syncStateChanged = Signal()
     authStatusChanged = Signal()
 
-    def __init__(self, vault: Path | None = None, parent: QObject | None = None):
+    def __init__(
+        self,
+        vault: Path | None = None,
+        parent: QObject | None = None,
+        sync_coordinator: SyncCoordinator | None = None,
+    ):
         super().__init__(parent)
         self._notice = "Pronto. Seus dados estão somente neste computador."
         vault_path = vault or default_vault_path()
@@ -52,9 +57,12 @@ class Backend(QObject):
         self._ideas: list[dict[str, str]] = []
         self._sync_state = STATE_LOCAL
         self._auth_status = "GitHub CLI não autenticado"
-        self._sync = SyncCoordinator(vault_path, auto_sync=vault is None)
+        self._sync = sync_coordinator or SyncCoordinator(vault_path, auto_sync=vault is None)
         self._sync.stateChanged.connect(self._on_sync_state)
         self._sync.authChanged.connect(self._on_auth_status)
+        self._sync.repositoryUpdated.connect(
+            self._reload_after_fast_forward, Qt.ConnectionType.QueuedConnection
+        )
         self.reload()
 
     @Property("QVariantList", notify=ideasChanged)
@@ -107,6 +115,17 @@ class Backend(QObject):
         else:
             self._auth_status = "GitHub CLI não autenticado"
         self.authStatusChanged.emit()
+
+    @Slot()
+    def _reload_after_fast_forward(self) -> None:
+        try:
+            self._ideas = [idea.as_dict() for idea in self._store.list_ideas()]
+            self.ideasChanged.emit()
+            self._set_notice("Cofre atualizado pelo Git.")
+        except StorageError as exc:
+            self._set_notice(str(exc))
+            self._sync_state = STATE_ERROR
+            self.syncStateChanged.emit()
 
     @Slot()
     def reload(self) -> None:

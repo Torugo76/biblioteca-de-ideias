@@ -2,10 +2,32 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from PySide6.QtCore import QCoreApplication, QObject, Signal
+
 from biblioteca_ideias.backend import Backend
+from biblioteca_ideias.git_sync import STATE_ERROR
+
+
+class FakeCoordinator(QObject):
+    stateChanged = Signal(str)
+    authChanged = Signal(bool, str)
+    repositoryUpdated = Signal()
+
+    def request_save(self, paths, message):
+        pass
+
+    def request_sync(self):
+        pass
+
+    def close(self):
+        pass
 
 
 class BackendTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QCoreApplication.instance() or QCoreApplication([])
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -70,6 +92,34 @@ class BackendTest(unittest.TestCase):
         self.assertIn("[imagem: Miniatura]", preview)
         self.assertIn("[imagem: Atalho]", preview)
         self.assertIn("[documentação](https://example.invalid/docs)", preview)
+
+    def test_repository_update_signal_reloads_ui_model(self) -> None:
+        coordinator = FakeCoordinator()
+        backend = Backend(self.root / "outro-cofre", sync_coordinator=coordinator)
+        try:
+            self.assertEqual(backend.ideaCount, 0)
+            backend._store.create("Chegou do remoto", "Corpo")
+            coordinator.repositoryUpdated.emit()
+            self.application.processEvents()
+            self.assertEqual(backend.ideaCount, 1)
+            self.assertEqual(backend.ideas[0]["titulo"], "Chegou do remoto")
+        finally:
+            backend._lock.unlock()
+
+    def test_repository_update_reload_failure_preserves_error_state(self) -> None:
+        coordinator = FakeCoordinator()
+        backend = Backend(self.root / "cofre-invalido", sync_coordinator=coordinator)
+        try:
+            idea = backend._store.create("Original", "Corpo")
+            duplicate = backend._store.vault / "avaliando" / "Duplicada.md"
+            duplicate.write_bytes(idea.path.read_bytes())
+            coordinator.stateChanged.emit("Sincronizado")
+            coordinator.repositoryUpdated.emit()
+            self.application.processEvents()
+            self.assertEqual(backend.syncStatus, STATE_ERROR)
+            self.assertIn("UUID duplicado", backend.notice)
+        finally:
+            backend._lock.unlock()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import queue
 import re
 import shutil
@@ -22,6 +23,15 @@ STATE_OFFLINE = "Offline"
 STATE_LOGIN = "Login necessário"
 STATE_CONFLICT = "Conflito precisa de atenção"
 STATE_ERROR = "Erro dados locais salvos"
+EXPECTED_REPOSITORY = "Torugo76/biblioteca-de-ideias-cofre"
+OFFICIAL_ORIGINS = {
+    "https://github.com/Torugo76/biblioteca-de-ideias-cofre",
+    "https://github.com/Torugo76/biblioteca-de-ideias-cofre.git",
+    "git@github.com:Torugo76/biblioteca-de-ideias-cofre",
+    "git@github.com:Torugo76/biblioteca-de-ideias-cofre.git",
+    "ssh://git@github.com/Torugo76/biblioteca-de-ideias-cofre",
+    "ssh://git@github.com/Torugo76/biblioteca-de-ideias-cofre.git",
+}
 
 GITHUB_TOKEN_PATTERN = re.compile(
     r"(?:gh[pousr](?:_|%5f)|github(?:_|%5f)pat(?:_|%5f))(?:[A-Za-z0-9_]|%[0-9a-f]{2})+",
@@ -70,10 +80,17 @@ def sanitize_output(value: str) -> str:
 
 
 class GitService:
-    def __init__(self, repo: Path, timeout: float = 20.0):
+    def __init__(
+        self,
+        repo: Path,
+        timeout: float = 20.0,
+        destination_validator: Callable[[], bool] | None = None,
+    ):
         self.repo = repo.resolve()
         self.timeout = timeout
         self.git = shutil.which("git")
+        self._destination_validator = destination_validator
+        self._validated_origin: str | None = None
 
     def _environment(self) -> dict[str, str]:
         environment = os.environ.copy()
@@ -142,6 +159,8 @@ class GitService:
         return any(True for _ in records)
 
     def fetch(self) -> CommandResult:
+        if not self.validate_destination():
+            return CommandResult(125, "", "destino remoto não validado")
         return self.run(("fetch", "--no-tags", "origin", "main"), timeout=max(self.timeout, 30))
 
     def ref(self, name: str) -> str | None:
@@ -152,20 +171,47 @@ class GitService:
         return self.run(("merge-base", "--is-ancestor", older, newer)).returncode == 0
 
     def fast_forward(self) -> CommandResult:
+        status, records = self.status_records()
+        if status.returncode != 0 or self.has_any_changes(records):
+            return CommandResult(3, "", "alterações concorrentes preservadas")
         local = self.ref("HEAD")
         remote = self.ref("origin/main")
         if not local or not remote or not self.is_ancestor(local, remote):
             return CommandResult(2, "", "fast-forward recusado")
-        restored = self.run(("restore", "--source=origin/main", "--staged", "--worktree", "--", "."))
-        if restored.returncode != 0:
-            return restored
+        advanced_tree = self.run(("read-tree", "-u", "-m", local, remote))
+        if advanced_tree.returncode != 0:
+            return advanced_tree
         advanced = self.run(("update-ref", "refs/heads/main", remote, local))
-        if advanced.returncode != 0:
-            self.run(("restore", f"--source={local}", "--staged", "--worktree", "--", "."))
+        if advanced.returncode == 0:
+            final_status, final_records = self.status_records()
+            if final_status.returncode != 0 or self.has_any_changes(final_records):
+                return CommandResult(3, "", "alterações concorrentes preservadas")
         return advanced
 
     def push(self) -> CommandResult:
+        if not self.validate_destination():
+            return CommandResult(125, "", "destino remoto não validado")
         return self.run(("push", "origin", "HEAD:main"), timeout=max(self.timeout, 30))
+
+    def validate_destination(self) -> bool:
+        if self._destination_validator is not None:
+            return bool(self._destination_validator())
+        branch = self.run(("symbolic-ref", "--quiet", "--short", "HEAD"))
+        origin = self.run(("remote", "get-url", "origin"))
+        if branch.returncode != 0 or branch.stdout.strip() != "main" or origin.returncode != 0:
+            self._validated_origin = None
+            return False
+        origin_url = origin.stdout.strip()
+        if origin_url not in OFFICIAL_ORIGINS:
+            self._validated_origin = None
+            return False
+        if self._validated_origin == origin_url:
+            return True
+        if not validate_github_repository_metadata():
+            self._validated_origin = None
+            return False
+        self._validated_origin = origin_url
+        return True
 
     def add_exact(self, relative_paths: Iterable[str]) -> CommandResult:
         paths = tuple(dict.fromkeys(relative_paths))
@@ -194,6 +240,12 @@ class GitService:
     def commit(self, message: str) -> CommandResult:
         return self.run(("commit", "--no-verify", "-m", message))
 
+    def unstage_exact(self, relative_paths: Iterable[str]) -> CommandResult:
+        paths = tuple(dict.fromkeys(relative_paths))
+        if not paths:
+            return CommandResult(0, "", "")
+        return self.run(("restore", "--staged", "--", *paths))
+
 
 def classify_failure(result: CommandResult) -> str:
     message = f"{result.stdout}\n{result.stderr}".casefold()
@@ -213,7 +265,7 @@ def classify_failure(result: CommandResult) -> str:
         )
     ):
         return STATE_LOGIN
-    if any(marker in message for marker in ("non-fast-forward", "[rejected]", "fetch first")):
+    if any(marker in message for marker in ("non-fast-forward", "[rejected]", "fetch first", "destino remoto não validado", "alterações concorrentes preservadas")):
         return STATE_CONFLICT
     return STATE_ERROR
 
@@ -249,9 +301,42 @@ def detect_github_cli(timeout: float = 5.0) -> tuple[bool, str | None]:
     return True, username
 
 
+def validate_github_repository_metadata(timeout: float = 8.0) -> bool:
+    gh = shutil.which("gh")
+    if gh is None:
+        return False
+    environment = os.environ.copy()
+    environment.update({"GH_PROMPT_DISABLED": "1", "NO_COLOR": "1", "LC_ALL": "C"})
+    try:
+        result = subprocess.run(
+            [gh, "repo", "view", EXPECTED_REPOSITORY, "--json", "nameWithOwner,visibility"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            timeout=timeout,
+            check=False,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    sanitized = sanitize_output(result.stdout.decode("utf-8", "replace"))
+    try:
+        metadata = json.loads(sanitized)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return (
+        metadata.get("nameWithOwner") == EXPECTED_REPOSITORY
+        and metadata.get("visibility") == "PRIVATE"
+    )
+
+
 class SyncCoordinator(QObject):
     stateChanged = Signal(str)
     authChanged = Signal(bool, str)
+    repositoryUpdated = Signal()
 
     def __init__(self, repo: Path, auto_sync: bool = True, service: GitService | None = None):
         super().__init__()
@@ -353,7 +438,11 @@ class SyncCoordinator(QObject):
             self._set_state(STATE_SYNCED)
         elif self.service.is_ancestor(local, remote):
             advanced = self.service.fast_forward()
-            self._set_state(STATE_SYNCED if advanced.returncode == 0 else STATE_CONFLICT)
+            if advanced.returncode == 0:
+                self._set_state(STATE_SYNCED)
+                self.repositoryUpdated.emit()
+            else:
+                self._set_state(STATE_CONFLICT)
         elif self.service.is_ancestor(remote, local):
             pushed = self.service.push()
             self._set_state(STATE_SYNCED if pushed.returncode == 0 else classify_failure(pushed))
@@ -373,11 +462,13 @@ class SyncCoordinator(QObject):
         staged_result, staged = self.service.staged_paths()
         allowed = set(paths)
         if staged_result.returncode != 0 or not staged.issubset(allowed):
+            self.service.unstage_exact(staged & allowed)
             self._set_state(STATE_CONFLICT)
             return
         if staged:
             committed = self.service.commit(message)
             if committed.returncode != 0:
+                self.service.unstage_exact(staged & allowed)
                 self._set_state(STATE_ERROR)
                 return
         fetched = self.service.fetch()
