@@ -513,6 +513,59 @@ class GitServiceSafetyTest(unittest.TestCase):
             self.assertEqual(metadata.call_count, 1)
 
     @patch("biblioteca_ideias.git_sync.validate_github_repository_metadata", return_value=True)
+    def test_official_fetch_with_malicious_pushurl_is_rejected_without_push(self, _metadata) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            false_remote = root / "false.git"
+            git(root, "init", "--initial-branch=main", str(repo))
+            git(root, "init", "--bare", "--initial-branch=main", str(false_remote))
+            git(repo, "remote", "add", "origin", "https://github.com/Torugo76/biblioteca-de-ideias-cofre.git")
+            git(repo, "remote", "set-url", "--add", "--push", "origin", false_remote.as_uri())
+            service = GitService(repo)
+            self.assertFalse(service.validate_destination())
+            self.assertEqual(service.push().returncode, 125)
+            self.assertEqual(list((false_remote / "refs" / "heads").iterdir()), [])
+
+    @patch("biblioteca_ideias.git_sync.validate_github_repository_metadata", return_value=True)
+    def test_multiple_pushurls_are_rejected_even_with_one_official(self, _metadata) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git(repo, "init", "--initial-branch=main")
+            git(repo, "remote", "add", "origin", "https://github.com/Torugo76/biblioteca-de-ideias-cofre.git")
+            git(repo, "remote", "set-url", "--add", "--push", "origin", "git@github.com:Torugo76/biblioteca-de-ideias-cofre.git")
+            git(repo, "remote", "set-url", "--add", "--push", "origin", "https://github.com/atacante/cofre.git")
+            self.assertFalse(GitService(repo).validate_destination())
+
+    @patch("biblioteca_ideias.git_sync.validate_github_repository_metadata", return_value=True)
+    def test_single_official_pushurl_accepts_https_or_ssh_and_fetch_fallback(self, _metadata) -> None:
+        push_variants = (
+            None,
+            "https://github.com/Torugo76/biblioteca-de-ideias-cofre.git",
+            "git@github.com:Torugo76/biblioteca-de-ideias-cofre.git",
+        )
+        for push_url in push_variants:
+            with self.subTest(push_url=push_url), tempfile.TemporaryDirectory() as temporary:
+                repo = Path(temporary)
+                git(repo, "init", "--initial-branch=main")
+                git(repo, "remote", "add", "origin", "https://github.com/Torugo76/biblioteca-de-ideias-cofre.git")
+                if push_url is not None:
+                    git(repo, "remote", "set-url", "--add", "--push", "origin", push_url)
+                self.assertTrue(GitService(repo).validate_destination())
+
+    @patch("biblioteca_ideias.git_sync.validate_github_repository_metadata", return_value=True)
+    def test_pushurl_swap_after_validation_is_rechecked_before_push(self, metadata) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git(repo, "init", "--initial-branch=main")
+            git(repo, "remote", "add", "origin", "https://github.com/Torugo76/biblioteca-de-ideias-cofre.git")
+            service = GitService(repo)
+            self.assertTrue(service.validate_destination())
+            git(repo, "remote", "set-url", "--add", "--push", "origin", "https://github.com/atacante/cofre.git")
+            self.assertEqual(service.push().returncode, 125)
+            self.assertEqual(metadata.call_count, 1)
+
+    @patch("biblioteca_ideias.git_sync.validate_github_repository_metadata", return_value=True)
     def test_destination_validation_rejects_userinfo_and_non_main_branch(self, _metadata) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary)

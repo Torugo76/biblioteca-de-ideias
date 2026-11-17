@@ -90,7 +90,7 @@ class GitService:
         self.timeout = timeout
         self.git = shutil.which("git")
         self._destination_validator = destination_validator
-        self._validated_origin: str | None = None
+        self._validated_destination: tuple[str, str] | None = None
 
     def _environment(self) -> dict[str, str]:
         environment = os.environ.copy()
@@ -211,20 +211,32 @@ class GitService:
         if self._destination_validator is not None:
             return bool(self._destination_validator())
         branch = self.run(("symbolic-ref", "--quiet", "--short", "HEAD"))
-        origin = self.run(("remote", "get-url", "origin"))
-        if branch.returncode != 0 or branch.stdout.strip() != "main" or origin.returncode != 0:
-            self._validated_origin = None
+        fetch_origin = self.run(("remote", "get-url", "origin"))
+        push_origins = self.run(("remote", "get-url", "--push", "--all", "origin"))
+        if (
+            branch.returncode != 0
+            or branch.stdout.strip() != "main"
+            or fetch_origin.returncode != 0
+            or push_origins.returncode != 0
+        ):
+            self._validated_destination = None
             return False
-        origin_url = origin.stdout.strip()
-        if origin_url not in OFFICIAL_ORIGINS:
-            self._validated_origin = None
+        fetch_url = fetch_origin.stdout.strip()
+        push_urls = [url.strip() for url in push_origins.stdout.splitlines() if url.strip()]
+        if (
+            fetch_url not in OFFICIAL_ORIGINS
+            or len(push_urls) != 1
+            or push_urls[0] not in OFFICIAL_ORIGINS
+        ):
+            self._validated_destination = None
             return False
-        if self._validated_origin == origin_url:
+        destination = (fetch_url, push_urls[0])
+        if self._validated_destination == destination:
             return True
         if not validate_github_repository_metadata():
-            self._validated_origin = None
+            self._validated_destination = None
             return False
-        self._validated_origin = origin_url
+        self._validated_destination = destination
         return True
 
     def add_exact(self, relative_paths: Iterable[str]) -> CommandResult:
