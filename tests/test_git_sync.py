@@ -185,6 +185,52 @@ class GitIntegrationTest(unittest.TestCase):
         self.assertNotIn("ghp_", sanitized)
         self.assertEqual(sanitize_output("primeiro\0segundo"), "primeiro\0segundo")
 
+    def test_all_github_token_prefixes_and_encoded_underscore_are_masked(self) -> None:
+        credentials = [
+            "gh" + prefix + "_abcdefghijklmnopqrstuvwxyz"
+            for prefix in ("p", "o", "u", "s", "r")
+        ]
+        credentials.extend(
+            (
+                "GHO" + "_ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                "github" + "_pat_abcdefghijklmnopqrstuvwxyz",
+                "ghp" + "%5Fabcdefghijklmnopqrstuvwxyz",
+                "%67%68%70%5F" + "abcdefghijklmnopqrstuvwxyz",
+            )
+        )
+        sanitized = sanitize_output(" ".join(credentials))
+        for credential in credentials:
+            self.assertNotIn(credential, sanitized)
+        self.assertEqual(sanitized.count("[credencial removida]"), len(credentials))
+
+    def test_sensitive_query_keys_are_decoded_and_normal_parameters_survive(self) -> None:
+        sensitive = (
+            "https://example.invalid/path?access" + "%5Ftoken=segredo1"
+            "&pa%73sword=segredo2&AUTH=segredo3#client-secret=segredo4"
+        )
+        normal = "&version=1&tokenizer=palavra&author=alguem"
+        sanitized = sanitize_output(sensitive + normal)
+        for secret in ("segredo1", "segredo2", "segredo3", "segredo4"):
+            self.assertNotIn(secret, sanitized)
+        self.assertIn(normal, sanitized)
+
+    @patch("biblioteca_ideias.git_sync.subprocess.run")
+    def test_git_service_never_returns_credentials_from_diagnostics(self, run) -> None:
+        credential = "gh" + "r_abcdefghijklmnopqrstuvwxyz"
+        query = "?access" + "_token=segredo-query"
+        run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=credential.encode(),
+            stderr=("falha https://usuario:senha@example.invalid/" + query).encode(),
+        )
+        service = GitService(self.a)
+        service.git = "/usr/bin/git"
+        result = service.run(("fetch", "--no-tags", "origin", "main"))
+        combined = result.stdout + result.stderr
+        self.assertNotIn(credential, combined)
+        self.assertNotIn("senha", combined)
+        self.assertNotIn("segredo-query", combined)
+        self.assertIn("falha", combined)
+
     @patch("biblioteca_ideias.git_sync.shutil.which", return_value="/usr/bin/gh")
     @patch("biblioteca_ideias.git_sync.subprocess.run")
     def test_github_cli_detection_uses_only_auth_status(self, run, _which) -> None:

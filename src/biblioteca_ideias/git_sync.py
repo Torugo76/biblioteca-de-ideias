@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import threading
+from urllib.parse import unquote, unquote_plus
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -22,10 +23,18 @@ STATE_LOGIN = "Login necessário"
 STATE_CONFLICT = "Conflito precisa de atenção"
 STATE_ERROR = "Erro dados locais salvos"
 
-TOKEN_PATTERN = re.compile(
-    r"(?:ghp_|github_pat_)[A-Za-z0-9_]+|https?://[^/@\s]+:[^/@\s]+@",
+GITHUB_TOKEN_PATTERN = re.compile(
+    r"(?:gh[pousr](?:_|%5f)|github(?:_|%5f)pat(?:_|%5f))(?:[A-Za-z0-9_]|%[0-9a-f]{2})+",
     re.IGNORECASE,
 )
+ENCODED_TOKEN_CANDIDATE = re.compile(r"(?:[A-Za-z0-9_]|%[0-9a-f]{2}){10,}", re.IGNORECASE)
+DECODED_GITHUB_TOKEN = re.compile(r"(?:gh[pousr]_\w+|github_pat_\w+)", re.IGNORECASE)
+URL_CREDENTIAL_PATTERN = re.compile(r"(https?://)[^/@\s]+@", re.IGNORECASE)
+QUERY_PARAMETER_PATTERN = re.compile(r"([?&#;])([^=&#;\s]+)=([^&#;\s]*)")
+SENSITIVE_QUERY_KEYS = {
+    "access_token", "token", "auth", "authorization", "password", "passwd",
+    "secret", "client_secret", "api_key", "apikey",
+}
 
 
 @dataclass(frozen=True)
@@ -36,7 +45,22 @@ class CommandResult:
 
 
 def sanitize_output(value: str) -> str:
-    without_credentials = TOKEN_PATTERN.sub("[credencial removida]", value)
+    without_credentials = GITHUB_TOKEN_PATTERN.sub("[credencial removida]", value)
+
+    def sanitize_encoded_token(match: re.Match[str]) -> str:
+        decoded = unquote(match.group(0))
+        return "[credencial removida]" if DECODED_GITHUB_TOKEN.fullmatch(decoded) else match.group(0)
+
+    without_credentials = ENCODED_TOKEN_CANDIDATE.sub(sanitize_encoded_token, without_credentials)
+    without_credentials = URL_CREDENTIAL_PATTERN.sub(r"\1[credencial removida]@", without_credentials)
+
+    def sanitize_parameter(match: re.Match[str]) -> str:
+        decoded_key = unquote_plus(match.group(2)).casefold().replace("-", "_")
+        if decoded_key in SENSITIVE_QUERY_KEYS:
+            return f"{match.group(1)}{match.group(2)}=[credencial removida]"
+        return match.group(0)
+
+    without_credentials = QUERY_PARAMETER_PATTERN.sub(sanitize_parameter, without_credentials)
     without_ansi = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", without_credentials)
     return "".join(
         character
