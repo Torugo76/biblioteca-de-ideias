@@ -420,13 +420,13 @@ class MarkdownStore:
             raise StorageError("O cofre mudou desde o planejamento da migração.")
         records = []
         for item in plan:
-            token = uuid.uuid4().hex
+            migration_nonce = uuid.uuid4().hex
             records.append(
                 {
                     "source": item.source.relative_to(self.vault).as_posix(),
-                    "temporary": item.source.with_name(f".migration-{token}.tmp").relative_to(self.vault).as_posix(),
+                    "temporary": item.source.with_name(f".migration-{migration_nonce}.tmp").relative_to(self.vault).as_posix(),
                     "destination": item.destination.relative_to(self.vault).as_posix(),
-                    "rollback": item.source.with_name(f".migration-rollback-{token}.tmp").relative_to(self.vault).as_posix(),
+                    "rollback": item.source.with_name(f".migration-rollback-{migration_nonce}.tmp").relative_to(self.vault).as_posix(),
                     "content_hash": item.content_hash,
                 }
             )
