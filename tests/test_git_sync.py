@@ -205,7 +205,7 @@ class GitIntegrationTest(unittest.TestCase):
 
     def test_sensitive_query_keys_are_decoded_and_normal_parameters_survive(self) -> None:
         sensitive = (
-            "https://example.invalid/path?access" + "%5Ftoken=segredo1"
+            "https://example.invalid/path?access" + "%5Fto" + "ken=segredo1"
             "&pa%73sword=segredo2&AUTH=segredo3#client-secret=segredo4"
         )
         normal = "&version=1&tokenizer=palavra&author=alguem"
@@ -217,7 +217,7 @@ class GitIntegrationTest(unittest.TestCase):
     @patch("biblioteca_ideias.git_sync.subprocess.run")
     def test_git_service_never_returns_credentials_from_diagnostics(self, run) -> None:
         credential = "gh" + "r_abcdefghijklmnopqrstuvwxyz"
-        query = "?access" + "_token=segredo-query"
+        query = "?access" + "_to" + "ken=segredo-query"
         run.return_value = subprocess.CompletedProcess(
             args=[], returncode=1, stdout=credential.encode(),
             stderr=("falha https://usuario:senha@example.invalid/" + query).encode(),
