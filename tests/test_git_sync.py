@@ -82,6 +82,9 @@ class GitIntegrationTest(unittest.TestCase):
             self.assertEqual(coordinator.state, STATE_SYNCED)
             self.assertTrue((self.a / "remota.md").exists())
             self.assertEqual(git(self.a, "rev-parse", "HEAD"), git(self.b, "rev-parse", "HEAD"))
+            self.assertEqual(git(self.a, "status", "--porcelain"), "")
+            self.assertEqual(git(self.a, "diff", "--cached", "--name-only"), "")
+            self.assertEqual(len(git(self.a, "rev-list", "--parents", "-n", "1", "HEAD").split()), 2)
         finally:
             coordinator.close()
 
@@ -108,6 +111,93 @@ class GitIntegrationTest(unittest.TestCase):
             self.assertEqual(coordinator.state, STATE_CONFLICT)
             self.assertEqual((self.a / "ideia.md").read_bytes(), b"edicao externa preservada\n")
             self.assertEqual(git(self.a, "rev-parse", "HEAD"), original_head)
+            self.assertEqual(git(self.a, "diff", "--cached", "--name-only"), "")
+            self.assertEqual(git(self.a, "stash", "list"), "")
+        finally:
+            coordinator.close()
+
+    def test_edit_injected_after_revalidation_is_refused_without_autostash(self) -> None:
+        (self.b / "ideia.md").write_text("remota\n", encoding="utf-8")
+        git(self.b, "add", "--", "ideia.md")
+        git(self.b, "commit", "-m", "remota")
+        git(self.b, "push", "origin", "main")
+        original_head = git(self.a, "rev-parse", "HEAD")
+
+        class EditingDuringMergeService(GitService):
+            injected = False
+
+            def run(inner_self, args, timeout=None):
+                if "merge" in args and not inner_self.injected:
+                    inner_self.injected = True
+                    (self.a / "ideia.md").write_bytes(b"edicao durante operacao\n")
+                return super().run(args, timeout)
+
+        service = EditingDuringMergeService(self.a, destination_validator=lambda: True)
+        coordinator = SyncCoordinator(self.a, auto_sync=False, service=service)
+        try:
+            coordinator.request_sync()
+            self.assertTrue(coordinator.wait_for_idle())
+            self.assertEqual(coordinator.state, STATE_CONFLICT)
+            self.assertEqual((self.a / "ideia.md").read_bytes(), b"edicao durante operacao\n")
+            self.assertEqual(git(self.a, "rev-parse", "HEAD"), original_head)
+            self.assertEqual(git(self.a, "diff", "--cached", "--name-only"), "")
+            self.assertEqual(git(self.a, "stash", "list"), "")
+        finally:
+            coordinator.close()
+
+    def test_concurrent_ref_movement_is_detected_with_coherent_tree(self) -> None:
+        (self.b / "remota.md").write_text("remota\n", encoding="utf-8")
+        git(self.b, "add", "--", "remota.md")
+        git(self.b, "commit", "-m", "remota")
+        git(self.b, "push", "origin", "main")
+
+        class MovingRefService(GitService):
+            def fetch(inner_self):
+                result = super().fetch()
+                old = git(self.a, "rev-parse", "HEAD")
+                tree = git(self.a, "rev-parse", "HEAD^{tree}")
+                concurrent = git(self.a, "commit-tree", tree, "-p", old, "-m", "concorrente")
+                git(self.a, "update-ref", "refs/heads/main", concurrent, old)
+                return result
+
+        service = MovingRefService(self.a, destination_validator=lambda: True)
+        coordinator = SyncCoordinator(self.a, auto_sync=False, service=service)
+        try:
+            coordinator.request_sync()
+            self.assertTrue(coordinator.wait_for_idle())
+            self.assertEqual(coordinator.state, STATE_CONFLICT)
+            self.assertEqual(git(self.a, "status", "--porcelain"), "")
+            self.assertEqual(git(self.a, "diff", "--cached", "--name-only"), "")
+        finally:
+            coordinator.close()
+
+    def test_ref_lock_contention_refuses_ff_without_partial_changes(self) -> None:
+        (self.b / "ideia.md").write_text("remota\n", encoding="utf-8")
+        git(self.b, "add", "--", "ideia.md")
+        git(self.b, "commit", "-m", "remota")
+        git(self.b, "push", "origin", "main")
+        original_head = git(self.a, "rev-parse", "HEAD")
+        original_bytes = (self.a / "ideia.md").read_bytes()
+
+        class LockedRefService(GitService):
+            def fast_forward(inner_self):
+                lock = self.a / ".git" / "refs" / "heads" / "main.lock"
+                lock.write_text("ocupado", encoding="utf-8")
+                try:
+                    return super().fast_forward()
+                finally:
+                    lock.unlink(missing_ok=True)
+
+        service = LockedRefService(self.a, destination_validator=lambda: True)
+        coordinator = SyncCoordinator(self.a, auto_sync=False, service=service)
+        try:
+            coordinator.request_sync()
+            self.assertTrue(coordinator.wait_for_idle())
+            self.assertEqual(coordinator.state, STATE_CONFLICT)
+            self.assertEqual(git(self.a, "rev-parse", "HEAD"), original_head)
+            self.assertEqual((self.a / "ideia.md").read_bytes(), original_bytes)
+            self.assertEqual(git(self.a, "status", "--porcelain"), "")
+            self.assertEqual(git(self.a, "diff", "--cached", "--name-only"), "")
         finally:
             coordinator.close()
 

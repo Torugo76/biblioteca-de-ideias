@@ -174,19 +174,33 @@ class GitService:
         status, records = self.status_records()
         if status.returncode != 0 or self.has_any_changes(records):
             return CommandResult(3, "", "alterações concorrentes preservadas")
+        if self.has_lock_contention():
+            return CommandResult(4, "", "repositório ocupado por outra operação Git")
         local = self.ref("HEAD")
         remote = self.ref("origin/main")
         if not local or not remote or not self.is_ancestor(local, remote):
             return CommandResult(2, "", "fast-forward recusado")
-        advanced_tree = self.run(("read-tree", "-u", "-m", local, remote))
-        if advanced_tree.returncode != 0:
-            return advanced_tree
-        advanced = self.run(("update-ref", "refs/heads/main", remote, local))
-        if advanced.returncode == 0:
-            final_status, final_records = self.status_records()
-            if final_status.returncode != 0 or self.has_any_changes(final_records):
-                return CommandResult(3, "", "alterações concorrentes preservadas")
+        advanced = self.run(
+            ("-c", "merge.autoStash=false", "merge", "--ff-only", "--no-edit", "origin/main")
+        )
+        final_status, final_records = self.status_records()
+        if advanced.returncode == 0 and (
+            final_status.returncode != 0 or self.has_any_changes(final_records)
+        ):
+            return CommandResult(3, "", "alterações concorrentes preservadas")
         return advanced
+
+    def has_lock_contention(self) -> bool:
+        for lock_name in ("index.lock", "refs/heads/main.lock", "packed-refs.lock"):
+            result = self.run(("rev-parse", "--git-path", lock_name))
+            if result.returncode != 0:
+                return True
+            lock_path = Path(result.stdout.strip())
+            if not lock_path.is_absolute():
+                lock_path = self.repo / lock_path
+            if lock_path.exists():
+                return True
+        return False
 
     def push(self) -> CommandResult:
         if not self.validate_destination():
@@ -265,7 +279,7 @@ def classify_failure(result: CommandResult) -> str:
         )
     ):
         return STATE_LOGIN
-    if any(marker in message for marker in ("non-fast-forward", "[rejected]", "fetch first", "destino remoto não validado", "alterações concorrentes preservadas")):
+    if any(marker in message for marker in ("non-fast-forward", "[rejected]", "fetch first", "destino remoto não validado", "alterações concorrentes preservadas", "repositório ocupado")):
         return STATE_CONFLICT
     return STATE_ERROR
 

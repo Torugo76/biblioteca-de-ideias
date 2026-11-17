@@ -10,7 +10,7 @@
 - A migração de nomes possui diário privado próprio e qualquer interrupção provoca rollback idempotente para os caminhos originais.
 - Git roda em uma thread dedicada com fila FIFO; somente fetch repetido pode ser agrupado.
 - Operações usam argumentos fixos, sem shell, prompts ou hooks, e nunca fazem merge, rebase, reset ou force-push.
-- Fast-forward revalida árvore/index, usa `read-tree -u -m <local> <remoto>` para recusar mudanças concorrentes e só então avança `main` com `update-ref` compare-and-swap.
+- Fast-forward revalida árvore/index e locks relevantes antes de usar `merge --ff-only --no-edit` com `merge.autoStash=false`; apesar do nome do comando, somente avanço linear é aceito, sem commit de merge, autostash ou resolução de divergência.
 - Cada salvamento local enfileira origem e destino exatos; staged externo bloqueia automação.
 - Todo fetch/push exige URL oficial exata, branch `main` e confirmação em sessão de que `Torugo76/biblioteca-de-ideias-cofre` é privado; troca posterior do remoto invalida a autorização.
 - Falha de commit executa `restore --staged` somente nos pathspecs exatos da operação e nunca altera o worktree.

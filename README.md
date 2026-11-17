@@ -56,7 +56,7 @@ O aplicativo usa uma fila FIFO única em uma thread dedicada; a interface não e
 - mudanças já staged por outro programa bloqueiam o commit automático;
 - atualização remota ocorre somente por fast-forward;
 - antes de rede, `origin` precisa apontar exatamente para o cofre privado oficial na branch `main`, confirmado por metadados do GitHub CLI;
-- o avanço revalida status/index, usa leitura de duas árvores que recusa edições concorrentes e atualiza `main` por compare-and-swap;
+- o avanço revalida status/index e locks do índice/referência, então usa `merge --ff-only` com `merge.autoStash=false`; esse comando apenas move a referência em fast-forward, nunca cria commit de merge nem resolve divergências;
 - divergências nunca geram merge, rebase, reset ou force-push;
 - falta de rede mantém o commit local como envio pendente;
 - falhas de Git não desfazem o Markdown salvo localmente;
