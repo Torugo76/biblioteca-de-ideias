@@ -179,8 +179,8 @@ class GitIntegrationTest(unittest.TestCase):
     def test_prompt_is_disabled_and_output_is_sanitized(self) -> None:
         service = GitService(self.a)
         self.assertEqual(service._environment()["GIT_TERMINAL_PROMPT"], "0")
-        fake_token = "ghp_" + "abcdefghijklmnopqrstuvwxyz"
-        sanitized = sanitize_output(f"https://usuario:segredo@example.invalid {fake_token}")
+        fake_credential = "ghp_" + "abcdefghijklmnopqrstuvwxyz"
+        sanitized = sanitize_output(f"https://usuario:segredo@example.invalid {fake_credential}")
         self.assertNotIn("segredo", sanitized)
         self.assertNotIn("ghp_", sanitized)
         self.assertEqual(sanitize_output("primeiro\0segundo"), "primeiro\0segundo")
