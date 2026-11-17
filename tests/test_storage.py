@@ -68,6 +68,37 @@ class MarkdownStoreTest(unittest.TestCase):
         with self.assertRaises(CollisionError):
             self.store.list_ideas()
 
+    def test_uuid_index_canonicalizes_uppercase_and_braces(self) -> None:
+        canonical = str(uuid.uuid4())
+        upper = canonical.upper()
+        braced = "{" + canonical + "}"
+        now = self.store._now()
+        first = self.vault / "entrada" / "Primeira.md"
+        second = self.vault / "avaliando" / "Segunda.md"
+        first.write_bytes(self.store._serialize(upper, "Primeira", "Corpo", now, now))
+        second.write_bytes(self.store._serialize(braced, "Segunda", "Corpo", now, now))
+
+        with self.assertRaises(CollisionError):
+            MarkdownStore(self.vault, self.state)
+
+    def test_legacy_uuid_text_is_preserved_until_save_then_normalized(self) -> None:
+        canonical = str(uuid.uuid4())
+        legacy = "{" + canonical.upper() + "}"
+        now = self.store._now()
+        path = self.vault / "entrada" / "Legada.md"
+        path.write_bytes(self.store._serialize(legacy, "Legada", "Corpo", now, now))
+        original = path.read_bytes()
+
+        reopened = MarkdownStore(self.vault, self.state)
+        idea = reopened.list_ideas()[0]
+        self.assertEqual(idea.idea_id, canonical)
+        self.assertEqual(path.read_bytes(), original)
+        saved = reopened.save_idea(
+            canonical, "Legada", idea.body, "entrada", idea.content_hash
+        )
+        self.assertIn(f"id: {canonical}".encode(), saved.path.read_bytes())
+        self.assertNotIn(legacy.encode(), saved.path.read_bytes())
+
     def test_save_renames_moves_and_updates_in_one_transaction(self) -> None:
         created = self.store.create("Título inicial", "## Resumo\n\nUm\n")
         saved = self.store.save_idea(
@@ -144,6 +175,124 @@ class MarkdownStoreTest(unittest.TestCase):
         self.assertEqual(migrated.path.name, "Ideia legada.md")
         self.assertEqual(migrated.path.read_bytes(), original)
         self.assertEqual(migrated.path.stat().st_mtime_ns, wanted_mtime)
+
+    def test_migration_recovers_after_interruptions_in_each_phase(self) -> None:
+        stages = (
+            ("after-planned", -1),
+            ("after-temporary", 0),
+            ("after-temporary-phase", -1),
+            ("after-destination", 0),
+        )
+        for stage, index in stages:
+            with self.subTest(stage=stage):
+                root = self.root / stage
+                store = MarkdownStore(root / "cofre", root / "estado")
+                idea_id = str(uuid.uuid4())
+                now = store._now()
+                source = store.vault / "entrada" / f"{idea_id}.md"
+                original = store._serialize(
+                    idea_id, "Título migrado", "## Resumo\n\nIntacto\n", now, now
+                )
+                source.write_bytes(original)
+                plan = store.plan_title_migration()
+
+                def crash(current_stage: str, current_index: int) -> None:
+                    if current_stage == stage and current_index == index:
+                        raise SystemExit("interrupção simulada")
+
+                store._migration_failure_hook = crash
+                with self.assertRaises(SystemExit):
+                    store.apply_title_migration(plan)
+
+                recovered = MarkdownStore(store.vault, store.state_dir)
+                ideas = recovered.list_ideas()
+                self.assertEqual(len(ideas), 1)
+                self.assertEqual(ideas[0].path, source)
+                self.assertEqual(source.read_bytes(), original)
+                self.assertFalse(recovered.migration_journal_path.exists())
+                self.assertEqual(list(store.vault.glob("*/.migration-*.tmp")), [])
+
+    def test_migration_recovery_is_idempotent_after_recovery_interruption(self) -> None:
+        idea_id = str(uuid.uuid4())
+        now = self.store._now()
+        source = self.vault / "entrada" / f"{idea_id}.md"
+        original = self.store._serialize(idea_id, "Recuperar", "Corpo", now, now)
+        source.write_bytes(original)
+        plan = self.store.plan_title_migration()
+
+        def migration_crash(stage: str, index: int) -> None:
+            if stage == "after-destination" and index == 0:
+                raise SystemExit
+
+        self.store._migration_failure_hook = migration_crash
+        with self.assertRaises(SystemExit):
+            self.store.apply_title_migration(plan)
+
+        def recovery_crash(stage: str, index: int) -> None:
+            if stage == "after-isolation" and index == 0:
+                raise SystemExit
+
+        self.store._migration_recovery_failure_hook = recovery_crash
+        with self.assertRaises(SystemExit):
+            self.store._recover_interrupted_migration()
+
+        recovered = MarkdownStore(self.vault, self.state)
+        ideas = recovered.list_ideas()
+        self.assertEqual(len(ideas), 1)
+        self.assertEqual(ideas[0].path, source)
+        self.assertEqual(source.read_bytes(), original)
+        self.assertFalse(recovered.migration_journal_path.exists())
+        self.assertEqual(list(self.vault.glob("*/.migration-*.tmp")), [])
+
+    def test_migration_recovery_handles_overlapping_source_and_destination(self) -> None:
+        now = self.store._now()
+        first_id = str(uuid.uuid4())
+        second_id = str(uuid.uuid4())
+        first_source = self.vault / "entrada" / "Alpha.md"
+        second_source = self.vault / "entrada" / f"{second_id}.md"
+        first_data = self.store._serialize(first_id, "Beta", "Primeiro", now, now)
+        second_data = self.store._serialize(second_id, "Alpha", "Segundo", now, now)
+        first_source.write_bytes(first_data)
+        second_source.write_bytes(second_data)
+        plan = self.store.plan_title_migration()
+
+        def crash(stage: str, index: int) -> None:
+            if stage == "after-destination" and index == 0:
+                raise SystemExit
+
+        self.store._migration_failure_hook = crash
+        with self.assertRaises(SystemExit):
+            self.store.apply_title_migration(plan)
+
+        recovered = MarkdownStore(self.vault, self.state)
+        by_id = {idea.idea_id: idea for idea in recovered.list_ideas()}
+        self.assertEqual(by_id[first_id].path, first_source)
+        self.assertEqual(by_id[second_id].path, second_source)
+        self.assertEqual(first_source.read_bytes(), first_data)
+        self.assertEqual(second_source.read_bytes(), second_data)
+
+    def test_migration_journal_is_private_and_orphans_are_not_ignored(self) -> None:
+        idea_id = str(uuid.uuid4())
+        now = self.store._now()
+        source = self.vault / "entrada" / f"{idea_id}.md"
+        source.write_bytes(self.store._serialize(idea_id, "Migrar", "Corpo", now, now))
+        plan = self.store.plan_title_migration()
+
+        def crash(stage: str, index: int) -> None:
+            if stage == "after-temporary" and index == 0:
+                raise SystemExit
+
+        self.store._migration_failure_hook = crash
+        with self.assertRaises(SystemExit):
+            self.store.apply_title_migration(plan)
+        self.assertEqual(self.state.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.store.migration_journal_path.stat().st_mode & 0o777, 0o600)
+        MarkdownStore(self.vault, self.state)
+
+        orphan = self.vault / "entrada" / ".migration-orphan.tmp"
+        orphan.write_bytes(b"nao deve ser ignorado")
+        with self.assertRaises(StorageError):
+            MarkdownStore(self.vault, self.state)
 
     def test_oversized_create_and_save_leave_original_state(self) -> None:
         with self.assertRaises(StorageError):

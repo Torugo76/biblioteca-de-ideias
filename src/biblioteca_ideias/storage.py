@@ -135,6 +135,8 @@ class MarkdownStore:
         self.state_dir = (state_dir or default_state).expanduser().resolve(strict=False)
         self._prepare_vault()
         self._prepare_state()
+        self._recover_interrupted_migration()
+        self._assert_no_orphan_migration_files()
         self._recover_interrupted_save()
         self._ideas_by_id: dict[str, Idea] = {}
         self._refresh_index()
@@ -157,6 +159,7 @@ class MarkdownStore:
         os.chmod(self.state_dir, 0o700)
         self.journal_path = self.state_dir / "save-journal.json"
         self.backup_path = self.state_dir / "save-backup.bin"
+        self.migration_journal_path = self.state_dir / "migration-journal.json"
 
     @staticmethod
     def _digest(data: bytes) -> str:
@@ -207,6 +210,12 @@ class MarkdownStore:
     def _failure_hook(self, stage: str) -> None:
         """Ponto de injeção usado somente por testes de recuperação."""
 
+    def _migration_failure_hook(self, stage: str, index: int) -> None:
+        """Ponto de injeção usado somente por testes de migração."""
+
+    def _migration_recovery_failure_hook(self, stage: str, index: int) -> None:
+        """Ponto de injeção usado somente por testes de retomada."""
+
     @staticmethod
     def _now() -> str:
         return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -253,7 +262,7 @@ class MarkdownStore:
         if any(not isinstance(meta.get(field), str) for field in required):
             raise StorageError(f"Campos obrigatórios inválidos: {path.name}")
         try:
-            uuid.UUID(meta["id"])
+            canonical_id = str(uuid.UUID(meta["id"]))
         except ValueError as exc:
             raise StorageError(f"UUID inválido: {path.name}") from exc
         body = match.group(2)
@@ -261,7 +270,7 @@ class MarkdownStore:
             body = body[1:]
         body = body.rstrip() + "\n"
         return Idea(
-            idea_id=meta["id"],
+            idea_id=canonical_id,
             title=meta["titulo"],
             body=body,
             status=status,
@@ -409,22 +418,106 @@ class MarkdownStore:
             (item.source, item.destination) for item in plan
         ]:
             raise StorageError("O cofre mudou desde o planejamento da migração.")
-        temporary: list[tuple[MigrationItem, Path]] = []
+        records = []
+        for item in plan:
+            token = uuid.uuid4().hex
+            records.append(
+                {
+                    "source": item.source.relative_to(self.vault).as_posix(),
+                    "temporary": item.source.with_name(f".migration-{token}.tmp").relative_to(self.vault).as_posix(),
+                    "destination": item.destination.relative_to(self.vault).as_posix(),
+                    "rollback": item.source.with_name(f".migration-rollback-{token}.tmp").relative_to(self.vault).as_posix(),
+                    "content_hash": item.content_hash,
+                }
+            )
+        self._write_migration_journal("planned", records)
         try:
-            for item in plan:
-                temp = item.source.with_name(f".migration-{uuid.uuid4().hex}.tmp")
-                os.replace(item.source, temp)
-                temporary.append((item, temp))
-            for item, temp in temporary:
-                os.replace(temp, item.destination)
+            self._migration_failure_hook("after-planned", -1)
+            self._write_migration_journal("moving-to-temporary", records)
+            for index, record in enumerate(records):
+                os.replace(
+                    self._safe_relative_path(record["source"]),
+                    self._safe_relative_path(record["temporary"]),
+                )
+                self._migration_failure_hook("after-temporary", index)
+            self._migration_failure_hook("after-temporary-phase", -1)
+            self._write_migration_journal("moving-to-destination", records)
+            for index, record in enumerate(records):
+                os.replace(
+                    self._safe_relative_path(record["temporary"]),
+                    self._safe_relative_path(record["destination"]),
+                )
+                self._migration_failure_hook("after-destination", index)
         except OSError as exc:
-            for item, temp in reversed(temporary):
-                if temp.exists():
-                    os.replace(temp, item.source)
-                elif item.destination.exists() and not item.source.exists():
-                    os.replace(item.destination, item.source)
+            self._recover_interrupted_migration()
             raise StorageError("A migração falhou e foi revertida.") from exc
+        self._clear_migration_journal()
         self._refresh_index()
+
+    def _write_migration_journal(self, phase: str, records: list[dict[str, str]]) -> None:
+        payload = json.dumps(
+            {"version": 1, "phase": phase, "items": records},
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+        self._atomic_write(self.migration_journal_path, payload)
+        os.chmod(self.migration_journal_path, 0o600)
+
+    def _clear_migration_journal(self) -> None:
+        if self.migration_journal_path.exists():
+            self.migration_journal_path.unlink()
+
+    def _recover_interrupted_migration(self) -> None:
+        if not self.migration_journal_path.exists():
+            return
+        try:
+            journal = json.loads(self.migration_journal_path.read_text(encoding="utf-8"))
+            if journal.get("version") != 1 or not isinstance(journal.get("items"), list):
+                raise ValueError("versão inválida")
+            records = journal["items"]
+            resolved: list[tuple[dict[str, str], Path]] = []
+            all_candidates = {
+                self._safe_relative_path(record[field])
+                for record in records
+                for field in ("source", "temporary", "destination", "rollback")
+            }
+            existing = [path for path in all_candidates if path.exists()]
+            for record in records:
+                matches = [
+                    path for path in existing
+                    if self._digest(path.read_bytes()) == record["content_hash"]
+                ]
+                if len(matches) != 1:
+                    raise StorageError("A recuperação não encontrou uma cópia única de uma ideia.")
+                resolved.append((record, matches[0]))
+
+            self._write_migration_journal("recovering", records)
+            for index, (record, current) in enumerate(resolved):
+                rollback = self._safe_relative_path(record["rollback"])
+                if current != rollback:
+                    os.replace(current, rollback)
+                self._migration_recovery_failure_hook("after-isolation", index)
+            self._migration_recovery_failure_hook("after-isolation-phase", -1)
+            for index, (record, _) in enumerate(resolved):
+                rollback = self._safe_relative_path(record["rollback"])
+                source = self._safe_relative_path(record["source"])
+                os.replace(rollback, source)
+                self._migration_recovery_failure_hook("after-restore", index)
+            for path in all_candidates:
+                if path.exists() and path.name.startswith(".migration-"):
+                    path.unlink()
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise StorageError("Não foi possível recuperar a migração interrompida.") from exc
+        self._clear_migration_journal()
+
+    def _assert_no_orphan_migration_files(self) -> None:
+        orphans = [
+            path
+            for status, _ in COLUMNS
+            for path in (self.vault / status).glob(".migration-*.tmp")
+        ]
+        if orphans:
+            raise StorageError("Foram encontrados temporários órfãos de migração.")
 
     @staticmethod
     def _atomic_write(path: Path, data: bytes) -> None:

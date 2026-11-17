@@ -41,6 +41,8 @@ O instalador cria um lançador pequeno em `~/.local/bin`, atualiza os caches de 
 
 O código e o cofre são repositórios Git separados. O corpo Markdown completo é canônico; o resumo exibido no cartão é derivado da seção `## Resumo`. O UUID permanece somente no front matter; o nome físico usa o título sanitizado e o status continua derivado da pasta.
 
+UUIDs são indexados pela forma canônica, portanto caixa alta e chaves não criam identidades diferentes. A grafia original de um arquivo legado é preservada até a ideia ser salva; nesse momento o front matter passa a usar a forma canônica.
+
 O salvamento usa um diário privado em `$XDG_STATE_HOME/Torugo/Biblioteca de Ideias` (padrão `~/.local/state/...`). Se o processo cair durante uma edição, a próxima abertura restaura a versão anterior antes de carregar o cofre.
 
 ## Testes
