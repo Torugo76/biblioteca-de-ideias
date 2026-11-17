@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Biblioteca de Ideias
+Comment=Organize ideias em um quadro Kanban local
+TryExec=biblioteca-de-ideias
+Exec=biblioteca-de-ideias
+Icon=br.com.torugo.bibliotecadeideias
+Terminal=false
+Categories=Office;ProjectManagement;
+StartupNotify=true
+StartupWMClass=br.com.torugo.bibliotecadeideias
+
