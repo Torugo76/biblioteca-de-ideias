@@ -112,10 +112,49 @@ class Backend(QObject):
 
     @Slot(str, result=str)
     def safePreviewMarkdown(self, markdown: str) -> str:
+        image_references: set[str] = set()
+
+        def normalized_reference(value: str) -> str:
+            return re.sub(r"\s+", " ", value.strip()).casefold()
+
+        def replace_inline(match: re.Match[str]) -> str:
+            return f"[imagem: {match.group(1)}]"
+
+        def replace_reference(match: re.Match[str]) -> str:
+            alt = match.group(1)
+            reference = match.group(2) or alt
+            image_references.add(normalized_reference(reference))
+            return f"[imagem: {alt}]"
+
+        def replace_shortcut(match: re.Match[str]) -> str:
+            alt = match.group(1)
+            image_references.add(normalized_reference(alt))
+            return f"[imagem: {alt}]"
+
         without_images = re.sub(
-            r"!\[([^\]]*)\]\([^)]*\)", r"[imagem: \1]", markdown
+            r"!\[([^\]\n]*)\]\s*\(\s*(?:<[^>\n]*>|[^)\n]*?)\s*\)",
+            replace_inline,
+            markdown,
         )
-        return html.escape(without_images, quote=False)
+        without_images = re.sub(
+            r"!\[([^\]\n]*)\][ \t]*\[([^\]\n]*)\]",
+            replace_reference,
+            without_images,
+        )
+        without_images = re.sub(
+            r"!\[([^\]\n]+)\](?![ \t]*[\[(])",
+            replace_shortcut,
+            without_images,
+        )
+
+        definition = re.compile(r"^[ \t]{0,3}\[([^\]\n]+)\]:[ \t]*\S.*$")
+        safe_lines: list[str] = []
+        for line in without_images.splitlines(keepends=True):
+            match = definition.match(line.rstrip("\r\n"))
+            if match and normalized_reference(match.group(1)) in image_references:
+                continue
+            safe_lines.append(line)
+        return html.escape("".join(safe_lines), quote=False)
 
     @Slot()
     def copyVaultPath(self) -> None:

@@ -41,13 +41,31 @@ class BackendTest(unittest.TestCase):
 
     def test_preview_escapes_html_and_removes_remote_images(self) -> None:
         preview = self.backend.safePreviewMarkdown(
-            "<script>alert(1)</script>\n![externa](https://example.invalid/a.png)\n[link](https://example.invalid)"
+            "<script>alert(1)</script>\n![externa](  https://example.invalid/a.png  )\n[link](https://example.invalid)"
         )
 
         self.assertIn("&lt;script&gt;", preview)
         self.assertNotIn("![", preview)
         self.assertIn("[imagem: externa]", preview)
         self.assertIn("[link](https://example.invalid)", preview)
+
+    def test_preview_removes_reference_images_and_their_definitions(self) -> None:
+        preview = self.backend.safePreviewMarkdown(
+            "![Capa][  Imagem   Principal ]\n"
+            "![Miniatura][]\n"
+            "![Atalho]\n"
+            "[imagem principal]: https://cdn.example.invalid/capa.png\n"
+            "[MINIATURA]: <https://cdn.example.invalid/miniatura.png>\n"
+            "[atalho]: https://cdn.example.invalid/atalho.png\n"
+            "[documentação](https://example.invalid/docs)\n"
+        )
+
+        self.assertNotIn("![", preview)
+        self.assertNotIn("cdn.example.invalid", preview)
+        self.assertIn("[imagem: Capa]", preview)
+        self.assertIn("[imagem: Miniatura]", preview)
+        self.assertIn("[imagem: Atalho]", preview)
+        self.assertIn("[documentação](https://example.invalid/docs)", preview)
 
 
 if __name__ == "__main__":
