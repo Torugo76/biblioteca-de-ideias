@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import html
+import os
 import re
 
 from PySide6.QtCore import QObject, Property, QLockFile, QStandardPaths, QUrl, Signal, Slot
@@ -19,6 +20,11 @@ def default_vault_path() -> Path:
     return root / "cofre"
 
 
+def default_state_path() -> Path:
+    root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return root / "Torugo" / "Biblioteca de Ideias"
+
+
 class Backend(QObject):
     ideasChanged = Signal()
     noticeChanged = Signal()
@@ -32,7 +38,8 @@ class Backend(QObject):
         self._lock.setStaleLockTime(30_000)
         if not self._lock.tryLock(0):
             raise StorageError("A Biblioteca de Ideias já está aberta para este cofre.")
-        self._store = MarkdownStore(vault_path)
+        state_path = default_state_path() if vault is None else vault_path.parent / ".state-test"
+        self._store = MarkdownStore(vault_path, state_dir=state_path)
         self._ideas: list[dict[str, str]] = []
         self.reload()
 
@@ -89,26 +96,15 @@ class Backend(QObject):
             return False
 
     @Slot(str, str, str, str, str, result=bool)
-    def updateIdea(self, idea_id: str, status: str, title: str, summary: str, expected_hash: str) -> bool:
+    def saveIdea(self, idea_id: str, title: str, body: str, status: str, expected_hash: str) -> bool:
         try:
-            self._store.update(idea_id, status, title, summary, expected_hash)
+            self._store.save_idea(idea_id, title, body, status, expected_hash)
             self.reload()
             self._set_notice("Ideia salva.")
             return True
         except StorageError as exc:
             self._set_notice(str(exc))
             return False
-
-    @Slot(str, str, str, str)
-    def moveIdea(self, idea_id: str, old_status: str, new_status: str, expected_hash: str) -> None:
-        if old_status == new_status:
-            return
-        try:
-            self._store.move(idea_id, old_status, new_status, expected_hash)
-            self.reload()
-            self._set_notice("Ideia movida.")
-        except StorageError as exc:
-            self._set_notice(str(exc))
 
     @Slot(str, result=str)
     def safePreviewMarkdown(self, markdown: str) -> str:

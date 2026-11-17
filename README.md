@@ -14,7 +14,10 @@ Aplicativo desktop para Fedora KDE que organiza ideias em um quadro Kanban e gra
 - gravação atômica com `QSaveFile`;
 - recusa de sobrescrita quando outro programa alterou o Markdown;
 - trava entre duas instâncias do aplicativo;
-- arquivos estáveis por UUID e rejeição de links simbólicos;
+- UUIDs estáveis no front matter e rejeição de links simbólicos;
+- nomes de arquivo legíveis derivados do título, preservando Unicode em NFC;
+- índice global de UUID e detecção de colisões por NFC sem diferenciar maiúsculas;
+- salvamento único e transacional de título, corpo e coluna, com recuperação XDG;
 - atalho no menu de aplicativos do KDE.
 
 O cofre fica em `~/.local/share/Torugo/Biblioteca de Ideias/cofre` (ou no equivalente definido pelo ambiente XDG). Configurações e estado do aplicativo não são gravados no cofre.
@@ -36,7 +39,9 @@ O instalador cria um lançador pequeno em `~/.local/bin`, atualiza os caches de 
 
 ## Dados e Git local
 
-O código e o cofre são repositórios Git locais separados. Nenhum remoto é configurado e nenhum conteúdo é enviado para a internet. O corpo Markdown completo é canônico; o resumo exibido no cartão é derivado da seção `## Resumo`.
+O código e o cofre são repositórios Git separados. O corpo Markdown completo é canônico; o resumo exibido no cartão é derivado da seção `## Resumo`. O UUID permanece somente no front matter; o nome físico usa o título sanitizado e o status continua derivado da pasta.
+
+O salvamento usa um diário privado em `$XDG_STATE_HOME/Torugo/Biblioteca de Ideias` (padrão `~/.local/state/...`). Se o processo cair durante uma edição, a próxima abertura restaura a versão anterior antes de carregar o cofre.
 
 ## Testes
 
@@ -51,7 +56,11 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - `qml/Main.qml`: quadro Kanban e diálogos;
 - `packaging/`: instalação e remoção locais.
 
+## Migração de nomes legados
+
+O utilitário `scripts/migrate_title_filenames.py` primeiro planeja todos os nomes e valida colisões. O modo `--simulate` trabalha em uma cópia temporária; `--apply` aplica no cofre indicado e confirma contagem, UUIDs, conteúdo e timestamps sem imprimir o texto das ideias.
+
 ## Limites atuais
 
-Não há remoto GitHub, sincronização, anexos, exclusão de cartões nem resolução visual de conflitos. A prévia não abre links nem carrega imagens remotas. O futuro inicializador de projetos e a futura orquestração Codex/Claude Code serão componentes separados e não fazem parte deste aplicativo neste momento.
+Os repositórios remotos existem, mas a sincronização automática ainda não faz parte do aplicativo. Também não há anexos, exclusão de cartões nem resolução visual de conflitos. A prévia não abre links nem carrega imagens remotas. O futuro inicializador de projetos e a futura orquestração Codex/Claude Code serão componentes separados e não fazem parte deste aplicativo neste momento.
 

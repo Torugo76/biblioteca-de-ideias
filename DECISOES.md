@@ -2,7 +2,10 @@
 
 - O aplicativo e o cofre são repositórios Git locais distintos, ainda sem remotos.
 - O status é derivado somente da pasta da ideia.
-- O nome físico é um UUID imutável; mudar o título não renomeia o arquivo.
+- O UUID é imutável e existe somente no front matter; o nome físico deriva do título.
+- Nomes preservam espaços, acentos e Unicode NFC; caracteres incompatíveis com Windows são substituídos.
+- Colisões são globais entre colunas por NFC + `casefold`, e UUIDs duplicados bloqueiam o cofre.
+- Título, corpo, nome e coluna são salvos por uma única operação com diário privado e rollback.
 - O app nunca sobrescreve silenciosamente uma edição externa.
 - O corpo Markdown integral é canônico; trechos dos cartões são derivados sem regravar o arquivo.
 - A prévia escapa HTML, remove imagens remotas e nunca abre links automaticamente.

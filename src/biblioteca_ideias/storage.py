@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
 import yaml
 from PySide6.QtCore import QSaveFile
 
@@ -20,8 +23,15 @@ COLUMNS: tuple[tuple[str, str], ...] = (
 )
 COLUMN_KEYS = {key for key, _ in COLUMNS}
 MAX_FILE_SIZE = 2 * 1024 * 1024
+MAX_FILENAME_BYTES = 240
 FRONT_MATTER = re.compile(r"\A---\n(.*?)\n---\n?(.*)\Z", re.DOTALL)
 SECTION = re.compile(r"(?ms)^##\s+Resumo\s*$\n?(.*?)(?=^#{1,6}\s+|\Z)")
+INVALID_FILENAME = re.compile(r'[<>:"/\\|?*]|[\x00-\x1f]')
+WINDOWS_RESERVED = {
+    "con", "prn", "aux", "nul",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+}
 INITIAL_BODY = """## Resumo
 
 
@@ -48,6 +58,10 @@ class ExternalChangeError(StorageError):
     pass
 
 
+class CollisionError(StorageError):
+    pass
+
+
 @dataclass(frozen=True)
 class Idea:
     idea_id: str
@@ -57,13 +71,13 @@ class Idea:
     created_at: str
     updated_at: str
     content_hash: str
+    path: Path
 
     @property
     def summary(self) -> str:
         match = SECTION.search(self.body)
         value = match.group(1).strip() if match else self.body.strip()
-        compact = " ".join(value.split())
-        return compact[:240]
+        return " ".join(value.split())[:240]
 
     def as_dict(self) -> dict[str, str]:
         return {
@@ -75,11 +89,41 @@ class Idea:
             "criada_em": self.created_at,
             "atualizada_em": self.updated_at,
             "hash": self.content_hash,
+            "arquivo": self.path.name,
         }
 
 
+@dataclass(frozen=True)
+class MigrationItem:
+    source: Path
+    destination: Path
+    idea_id: str
+    content_hash: str
+    modified_ns: int
+
+
+def title_filename(title: str) -> str:
+    normalized = unicodedata.normalize("NFC", title)
+    replaced = INVALID_FILENAME.sub("-", normalized).rstrip(" .")
+    if replaced in {"", ".", ".."}:
+        raise StorageError("O título não produz um nome de arquivo válido.")
+    device_name = replaced.split(".", 1)[0].casefold()
+    if device_name in WINDOWS_RESERVED:
+        raise StorageError("O título corresponde a um nome reservado do Windows.")
+    filename = f"{replaced}.md"
+    if len(filename.encode("utf-8")) > MAX_FILENAME_BYTES:
+        raise StorageError(
+            f"O nome do arquivo excede o limite seguro de {MAX_FILENAME_BYTES} bytes."
+        )
+    return filename
+
+
+def filename_key(filename: str) -> str:
+    return unicodedata.normalize("NFC", filename).casefold()
+
+
 class MarkdownStore:
-    def __init__(self, vault: Path):
+    def __init__(self, vault: Path, state_dir: Path | None = None):
         requested = Path(os.path.abspath(os.fspath(vault.expanduser())))
         for component in (requested, *requested.parents):
             if component.is_symlink():
@@ -87,7 +131,13 @@ class MarkdownStore:
                     f"O caminho do cofre não pode conter links simbólicos: {component}"
                 )
         self.vault = requested.resolve(strict=False)
+        default_state = self.vault.parent / ".biblioteca-de-ideias-state"
+        self.state_dir = (state_dir or default_state).expanduser().resolve(strict=False)
         self._prepare_vault()
+        self._prepare_state()
+        self._recover_interrupted_save()
+        self._ideas_by_id: dict[str, Idea] = {}
+        self._refresh_index()
 
     def _prepare_vault(self) -> None:
         if self.vault.exists() and self.vault.is_symlink():
@@ -102,29 +152,60 @@ class MarkdownStore:
             if not keep.exists():
                 keep.touch()
 
+    def _prepare_state(self) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.state_dir, 0o700)
+        self.journal_path = self.state_dir / "save-journal.json"
+        self.backup_path = self.state_dir / "save-backup.bin"
+
     @staticmethod
     def _digest(data: bytes) -> str:
         return hashlib.sha256(data).hexdigest()
 
-    def _path(self, status: str, idea_id: str) -> Path:
-        if status not in COLUMN_KEYS:
-            raise StorageError("Coluna inválida.")
-        try:
-            parsed = uuid.UUID(idea_id)
-        except ValueError as exc:
-            raise StorageError("Identificador de ideia inválido.") from exc
-        filename = f"{parsed}.md"
-        column = self.vault / status
-        if column.is_symlink():
-            raise StorageError("A coluna não pode ser um link simbólico.")
-        target = column / filename
-        if target.is_symlink():
-            raise StorageError("O arquivo da ideia não pode ser um link simbólico.")
+    def _safe_relative_path(self, relative: str) -> Path:
+        target = self.vault / relative
         try:
             target.resolve(strict=False).relative_to(self.vault)
         except ValueError as exc:
-            raise StorageError("O arquivo está fora do cofre.") from exc
+            raise StorageError("O diário contém um caminho fora do cofre.") from exc
+        if target.is_symlink():
+            raise StorageError("O diário aponta para um link simbólico.")
         return target
+
+    def _recover_interrupted_save(self) -> None:
+        if not self.journal_path.exists():
+            return
+        try:
+            record = json.loads(self.journal_path.read_text(encoding="utf-8"))
+            source = self._safe_relative_path(record["source"])
+            target = self._safe_relative_path(record["target"])
+            backup = self.backup_path.read_bytes()
+            self._atomic_write(source, backup)
+            if target != source and target.exists():
+                target.unlink()
+        except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+            raise StorageError("Não foi possível recuperar uma gravação interrompida.") from exc
+        self._clear_journal()
+
+    def _write_journal(self, source: Path, target: Path, original: bytes) -> None:
+        self.backup_path.write_bytes(original)
+        os.chmod(self.backup_path, 0o600)
+        record = {
+            "version": 1,
+            "source": source.relative_to(self.vault).as_posix(),
+            "target": target.relative_to(self.vault).as_posix(),
+        }
+        data = json.dumps(record, ensure_ascii=False).encode("utf-8")
+        self._atomic_write(self.journal_path, data)
+        os.chmod(self.journal_path, 0o600)
+
+    def _clear_journal(self) -> None:
+        for path in (self.journal_path, self.backup_path):
+            if path.exists():
+                path.unlink()
+
+    def _failure_hook(self, stage: str) -> None:
+        """Ponto de injeção usado somente por testes de recuperação."""
 
     @staticmethod
     def _now() -> str:
@@ -171,75 +252,179 @@ class MarkdownStore:
         required = ("id", "titulo", "criada_em", "atualizada_em")
         if any(not isinstance(meta.get(field), str) for field in required):
             raise StorageError(f"Campos obrigatórios inválidos: {path.name}")
-        expected = path.stem
-        if meta["id"] != expected:
-            raise StorageError(f"ID do arquivo não corresponde ao cabeçalho: {path.name}")
+        try:
+            uuid.UUID(meta["id"])
+        except ValueError as exc:
+            raise StorageError(f"UUID inválido: {path.name}") from exc
         body = match.group(2)
         if body.startswith("\n"):
             body = body[1:]
         body = body.rstrip() + "\n"
         return Idea(
             idea_id=meta["id"],
-            title=meta["titulo"].strip(),
+            title=meta["titulo"],
             body=body,
             status=status,
             created_at=meta["criada_em"],
             updated_at=meta["atualizada_em"],
             content_hash=self._digest(data),
+            path=path,
         )
 
-    def list_ideas(self) -> list[Idea]:
+    def _scan(self) -> list[Idea]:
         ideas: list[Idea] = []
+        ids: dict[str, Path] = {}
+        names: dict[str, Path] = {}
         for status, _ in COLUMNS:
             column = self.vault / status
             if column.is_symlink():
                 raise StorageError(f"A coluna {status} se tornou um link simbólico.")
             for path in sorted(column.glob("*.md")):
-                ideas.append(self._parse(path, status))
+                idea = self._parse(path, status)
+                if idea.idea_id in ids:
+                    raise CollisionError(
+                        f"UUID duplicado em {ids[idea.idea_id].name} e {path.name}."
+                    )
+                key = filename_key(path.name)
+                if key in names:
+                    raise CollisionError(
+                        f"Nomes de arquivo colidem entre {names[key].name} e {path.name}."
+                    )
+                ids[idea.idea_id] = path
+                names[key] = path
+                ideas.append(idea)
         return ideas
 
+    def _refresh_index(self) -> list[Idea]:
+        ideas = self._scan()
+        self._ideas_by_id = {idea.idea_id: idea for idea in ideas}
+        return ideas
+
+    def list_ideas(self) -> list[Idea]:
+        return self._refresh_index()
+
+    def _target_path(self, status: str, title: str) -> Path:
+        if status not in COLUMN_KEYS:
+            raise StorageError("Coluna inválida.")
+        column = self.vault / status
+        if column.is_symlink():
+            raise StorageError("A coluna não pode ser um link simbólico.")
+        target = column / title_filename(title)
+        if target.is_symlink():
+            raise StorageError("O arquivo da ideia não pode ser um link simbólico.")
+        try:
+            target.resolve(strict=False).relative_to(self.vault)
+        except ValueError as exc:
+            raise StorageError("O arquivo está fora do cofre.") from exc
+        return target
+
+    def _assert_name_available(self, target: Path, excluding_id: str | None = None) -> None:
+        wanted = filename_key(target.name)
+        for idea in self._ideas_by_id.values():
+            if idea.idea_id != excluding_id and filename_key(idea.path.name) == wanted:
+                raise CollisionError(f"Já existe uma ideia chamada “{target.stem}”.")
+
     def create(self, title: str, body: str) -> Idea:
-        title = title.strip()
-        if not title:
+        if not title.strip():
             raise StorageError("Informe um título.")
+        self._refresh_index()
+        target = self._target_path("entrada", title)
+        self._assert_name_available(target)
         idea_id = str(uuid.uuid4())
         now = self._now()
-        path = self._path("entrada", idea_id)
         data = self._serialize(idea_id, title, body or INITIAL_BODY, now, now)
         self._validate_serialized_size(data)
-        self._atomic_write(path, data)
-        return self._parse(path, "entrada")
+        self._atomic_write(target, data)
+        self._refresh_index()
+        return self._ideas_by_id[idea_id]
 
-    def update(self, idea_id: str, status: str, title: str, body: str, expected_hash: str) -> Idea:
-        title = title.strip()
-        if not title:
+    def save_idea(
+        self,
+        idea_id: str,
+        title: str,
+        body: str,
+        status: str,
+        expected_hash: str,
+    ) -> Idea:
+        if not title.strip():
             raise StorageError("Informe um título.")
-        path = self._path(status, idea_id)
-        current = self._parse(path, status)
+        self._refresh_index()
+        current = self._ideas_by_id.get(idea_id)
+        if current is None:
+            raise StorageError("Ideia não encontrada.")
         if current.content_hash != expected_hash:
             raise ExternalChangeError(
                 "A ideia foi alterada por outro programa. Recarregue antes de salvar."
             )
+        target = self._target_path(status, title)
+        self._assert_name_available(target, excluding_id=idea_id)
         data = self._serialize(idea_id, title, body, current.created_at, self._now())
         self._validate_serialized_size(data)
-        self._atomic_write(path, data)
-        return self._parse(path, status)
-
-    def move(self, idea_id: str, old_status: str, new_status: str, expected_hash: str) -> Idea:
-        source = self._path(old_status, idea_id)
-        destination = self._path(new_status, idea_id)
-        current = self._parse(source, old_status)
-        if current.content_hash != expected_hash:
-            raise ExternalChangeError(
-                "A ideia foi alterada por outro programa. Recarregue antes de mover."
-            )
-        if destination.exists():
-            raise StorageError("Já existe uma ideia com este ID na coluna de destino.")
+        original = current.path.read_bytes()
+        self._write_journal(current.path, target, original)
         try:
-            os.replace(source, destination)
+            self._atomic_write(target, data)
+            self._failure_hook("target-written")
+            if target != current.path:
+                current.path.unlink()
+            self._failure_hook("source-removed")
+        except Exception as exc:
+            self._recover_interrupted_save()
+            if isinstance(exc, StorageError):
+                raise
+            raise StorageError("A operação falhou e a ideia original foi restaurada.") from exc
+        self._clear_journal()
+        self._refresh_index()
+        return self._ideas_by_id[idea_id]
+
+    def plan_title_migration(self) -> list[MigrationItem]:
+        ideas = self._refresh_index()
+        destinations: dict[str, Path] = {}
+        plan: list[MigrationItem] = []
+        for idea in ideas:
+            destination = self._target_path(idea.status, idea.title)
+            key = filename_key(destination.name)
+            previous = destinations.get(key)
+            if previous is not None and previous != idea.path:
+                raise CollisionError(
+                    f"A migração produziria nomes colidentes: {previous.name} e {destination.name}."
+                )
+            destinations[key] = idea.path
+            if idea.path != destination:
+                stat = idea.path.stat()
+                plan.append(
+                    MigrationItem(
+                        source=idea.path,
+                        destination=destination,
+                        idea_id=idea.idea_id,
+                        content_hash=idea.content_hash,
+                        modified_ns=stat.st_mtime_ns,
+                    )
+                )
+        return plan
+
+    def apply_title_migration(self, plan: list[MigrationItem]) -> None:
+        current_plan = self.plan_title_migration()
+        if [(item.source, item.destination) for item in current_plan] != [
+            (item.source, item.destination) for item in plan
+        ]:
+            raise StorageError("O cofre mudou desde o planejamento da migração.")
+        temporary: list[tuple[MigrationItem, Path]] = []
+        try:
+            for item in plan:
+                temp = item.source.with_name(f".migration-{uuid.uuid4().hex}.tmp")
+                os.replace(item.source, temp)
+                temporary.append((item, temp))
+            for item, temp in temporary:
+                os.replace(temp, item.destination)
         except OSError as exc:
-            raise StorageError(f"Não foi possível mover a ideia: {exc}") from exc
-        return self._parse(destination, new_status)
+            for item, temp in reversed(temporary):
+                if temp.exists():
+                    os.replace(temp, item.source)
+                elif item.destination.exists() and not item.source.exists():
+                    os.replace(item.destination, item.source)
+            raise StorageError("A migração falhou e foi revertida.") from exc
+        self._refresh_index()
 
     @staticmethod
     def _atomic_write(path: Path, data: bytes) -> None:
@@ -252,4 +437,3 @@ class MarkdownStore:
             raise StorageError(f"Não foi possível gravar {path.name} por completo.")
         if not save.commit():
             raise StorageError(f"Não foi possível concluir a gravação segura de {path.name}.")
-

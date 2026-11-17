@@ -15,12 +15,12 @@ class BackendTest(unittest.TestCase):
         self.backend._lock.unlock()
         self.temporary.cleanup()
 
-    def test_update_returns_false_and_preserves_status_on_failure(self) -> None:
+    def test_save_returns_false_and_preserves_status_on_failure(self) -> None:
         idea = self.backend._store.create("Original", "Resumo")
         self.backend.reload()
 
-        saved = self.backend.updateIdea(
-            idea.idea_id, "entrada", "Alterada", "Outro", "hash-incorreto"
+        saved = self.backend.saveIdea(
+            idea.idea_id, "Alterada", "Outro", "avaliando", "hash-incorreto"
         )
 
         self.assertFalse(saved)
@@ -29,15 +29,18 @@ class BackendTest(unittest.TestCase):
         self.assertEqual(persisted.status, "entrada")
         self.assertIn("alterada por outro programa", self.backend.notice)
 
-    def test_update_returns_true_on_success(self) -> None:
+    def test_save_returns_true_on_rename_and_move(self) -> None:
         idea = self.backend._store.create("Original", "Resumo")
 
-        saved = self.backend.updateIdea(
-            idea.idea_id, "entrada", "Alterada", "Outro", idea.content_hash
+        saved = self.backend.saveIdea(
+            idea.idea_id, "Alterada", "Outro", "avaliando", idea.content_hash
         )
 
         self.assertTrue(saved)
-        self.assertEqual(self.backend._store.list_ideas()[0].title, "Alterada")
+        persisted = self.backend._store.list_ideas()[0]
+        self.assertEqual(persisted.title, "Alterada")
+        self.assertEqual(persisted.status, "avaliando")
+        self.assertEqual(persisted.path.name, "Alterada.md")
 
     def test_preview_escapes_html_and_removes_remote_images(self) -> None:
         preview = self.backend.safePreviewMarkdown(

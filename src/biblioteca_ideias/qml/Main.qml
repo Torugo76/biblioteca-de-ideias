@@ -265,20 +265,10 @@ Kirigami.ApplicationWindow {
                     onClicked: {
                         var saved = false
                         if (root.selectedIdea.id) {
-                            saved = backend.updateIdea(root.selectedIdea.id, root.selectedIdea.status,
-                                                       editorTitle.text, editorBody.text,
-                                                       root.selectedIdea.hash)
-                            if (saved) {
-                                var newStatus = backend.columns[statusCombo.currentIndex].chave
-                                if (newStatus !== root.selectedIdea.status) {
-                                    var refreshed = backend.ideas.find(function(item) {
-                                        return item.id === root.selectedIdea.id
-                                    })
-                                    if (refreshed)
-                                        backend.moveIdea(refreshed.id, refreshed.status,
-                                                         newStatus, refreshed.hash)
-                                }
-                            }
+                            var newStatus = backend.columns[statusCombo.currentIndex].chave
+                            saved = backend.saveIdea(root.selectedIdea.id, editorTitle.text,
+                                                     editorBody.text, newStatus,
+                                                     root.selectedIdea.hash)
                         } else {
                             saved = backend.createIdea(editorTitle.text, editorBody.text)
                         }
