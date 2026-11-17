@@ -15,7 +15,7 @@ from .storage import StorageError
 def main() -> int:
     QCoreApplication.setOrganizationName("Torugo")
     QCoreApplication.setApplicationName("Biblioteca de Ideias")
-    QCoreApplication.setApplicationVersion("0.3.0")
+    QCoreApplication.setApplicationVersion("0.4.0")
     QGuiApplication.setDesktopFileName(APP_ID)
 
     app = QGuiApplication(sys.argv)
@@ -37,6 +37,7 @@ def main() -> int:
     except StorageError as exc:
         print(f"Erro: {exc}", file=sys.stderr)
         return 2
+    app.aboutToQuit.connect(backend.close)
 
     engine = QQmlApplicationEngine()
     engine.rootContext().setContextProperty("backend", backend)

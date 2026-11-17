@@ -8,6 +8,10 @@
 - Título, corpo, nome e coluna são salvos por uma única operação com diário privado e rollback.
 - UUIDs são comparados na forma canônica; grafias legadas ficam intactas até o próximo salvamento, que normaliza o front matter.
 - A migração de nomes possui diário privado próprio e qualquer interrupção provoca rollback idempotente para os caminhos originais.
+- Git roda em uma thread dedicada com fila FIFO; somente fetch repetido pode ser agrupado.
+- Operações usam argumentos fixos, sem shell, prompts ou hooks, e nunca fazem merge, rebase, reset ou force-push.
+- Fast-forward atualiza worktree/index e a referência `main` apenas depois de validar ancestralidade; divergências são preservadas para atenção manual.
+- Cada salvamento local enfileira origem e destino exatos; staged externo bloqueia automação.
 - O app nunca sobrescreve silenciosamente uma edição externa.
 - O corpo Markdown integral é canônico; trechos dos cartões são derivados sem regravar o arquivo.
 - A prévia escapa HTML, remove imagens remotas e nunca abre links automaticamente.

@@ -12,6 +12,7 @@ class BackendTest(unittest.TestCase):
         self.backend = Backend(self.root / "cofre")
 
     def tearDown(self) -> None:
+        self.backend.close()
         self.backend._lock.unlock()
         self.temporary.cleanup()
 

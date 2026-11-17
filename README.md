@@ -11,6 +11,8 @@ Aplicativo desktop para Fedora KDE que organiza ideias em um quadro Kanban e gra
 - editor Markdown amplo com modelo inicial, atalhos e pré-visualização passiva;
 - preservação do corpo integral e de seções personalizadas;
 - tela de configurações com caminho real, abertura segura e quantidade de ideias;
+- sincronização Git assíncrona ao abrir, manualmente e após cada salvamento;
+- estados claros para offline, autenticação, envio pendente e divergência;
 - gravação atômica com `QSaveFile`;
 - recusa de sobrescrita quando outro programa alterou o Markdown;
 - trava entre duas instâncias do aplicativo;
@@ -45,6 +47,21 @@ UUIDs são indexados pela forma canônica, portanto caixa alta e chaves não cri
 
 O salvamento usa um diário privado em `$XDG_STATE_HOME/Torugo/Biblioteca de Ideias` (padrão `~/.local/state/...`). Se o processo cair durante uma edição, a próxima abertura restaura a versão anterior antes de carregar o cofre.
 
+## Sincronização segura
+
+O aplicativo usa uma fila FIFO única em uma thread dedicada; a interface não espera por rede. Salvamentos nunca são agrupados. Pedidos repetidos de atualização podem ser combinados enquanto um já está pendente.
+
+- Git é chamado sem shell, aliases, prompts ou hooks;
+- somente os caminhos exatos de cada operação são adicionados;
+- mudanças já staged por outro programa bloqueiam o commit automático;
+- atualização remota ocorre somente por fast-forward;
+- divergências nunca geram merge, rebase, reset ou force-push;
+- falta de rede mantém o commit local como envio pendente;
+- falhas de Git não desfazem o Markdown salvo localmente;
+- o GitHub CLI é consultado apenas com `gh auth status`; tokens e arquivos de credenciais não são lidos.
+
+O botão **Sincronizar** executa a atualização manual. A barra informa: Sincronizado, Sincronizando, Alterações locais, Envio pendente, Offline, Login necessário, Conflito precisa de atenção ou Erro dados locais salvos.
+
 ## Testes
 
 ```bash
@@ -64,5 +81,5 @@ O utilitário `scripts/migrate_title_filenames.py` primeiro planeja todos os nom
 
 ## Limites atuais
 
-Os repositórios remotos existem, mas a sincronização automática ainda não faz parte do aplicativo. Também não há anexos, exclusão de cartões nem resolução visual de conflitos. A prévia não abre links nem carrega imagens remotas. O futuro inicializador de projetos e a futura orquestração Codex/Claude Code serão componentes separados e não fazem parte deste aplicativo neste momento.
+Não há login web, clonagem assistida para outro computador, anexos, exclusão de cartões nem resolução visual de conflitos. A prévia não abre links nem carrega imagens remotas. O futuro inicializador de projetos e a futura orquestração Codex/Claude Code serão componentes separados e não fazem parte deste aplicativo neste momento.
 

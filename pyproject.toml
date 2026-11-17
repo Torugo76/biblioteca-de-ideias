@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "biblioteca-de-ideias"
-version = "0.3.0"
+version = "0.4.0"
 description = "Quadro Kanban local para organizar ideias em Markdown"
 readme = "README.md"
 requires-python = ">=3.12"

@@ -10,17 +10,24 @@ from PySide6.QtCore import QObject, Property, QLockFile, QStandardPaths, QUrl, S
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 
 from .storage import COLUMNS, INITIAL_BODY, MarkdownStore, StorageError
+from .git_sync import STATE_LOCAL, SyncCoordinator
 
 
 APP_ID = "br.com.torugo.bibliotecadeideias"
 
 
 def default_vault_path() -> Path:
+    override = os.environ.get("BIBLIOTECA_IDEIAS_VAULT")
+    if override:
+        return Path(override)
     root = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))
     return root / "cofre"
 
 
 def default_state_path() -> Path:
+    explicit = os.environ.get("BIBLIOTECA_IDEIAS_STATE")
+    if explicit:
+        return Path(explicit)
     root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
     return root / "Torugo" / "Biblioteca de Ideias"
 
@@ -28,6 +35,8 @@ def default_state_path() -> Path:
 class Backend(QObject):
     ideasChanged = Signal()
     noticeChanged = Signal()
+    syncStateChanged = Signal()
+    authStatusChanged = Signal()
 
     def __init__(self, vault: Path | None = None, parent: QObject | None = None):
         super().__init__(parent)
@@ -41,6 +50,11 @@ class Backend(QObject):
         state_path = default_state_path() if vault is None else vault_path.parent / ".state-test"
         self._store = MarkdownStore(vault_path, state_dir=state_path)
         self._ideas: list[dict[str, str]] = []
+        self._sync_state = STATE_LOCAL
+        self._auth_status = "GitHub CLI não autenticado"
+        self._sync = SyncCoordinator(vault_path, auto_sync=vault is None)
+        self._sync.stateChanged.connect(self._on_sync_state)
+        self._sync.authChanged.connect(self._on_auth_status)
         self.reload()
 
     @Property("QVariantList", notify=ideasChanged)
@@ -63,9 +77,13 @@ class Backend(QObject):
     def ideaCount(self) -> int:
         return len(self._ideas)
 
-    @Property(str, constant=True)
+    @Property(str, notify=syncStateChanged)
     def syncStatus(self) -> str:
-        return "Sincronização ainda não configurada"
+        return self._sync_state
+
+    @Property(str, notify=authStatusChanged)
+    def authStatus(self) -> str:
+        return self._auth_status
 
     @Property(str, constant=True)
     def initialBody(self) -> str:
@@ -74,6 +92,21 @@ class Backend(QObject):
     def _set_notice(self, message: str) -> None:
         self._notice = message
         self.noticeChanged.emit()
+
+    @Slot(str)
+    def _on_sync_state(self, state: str) -> None:
+        self._sync_state = state
+        self.syncStateChanged.emit()
+
+    @Slot(bool, str)
+    def _on_auth_status(self, authenticated: bool, username: str) -> None:
+        if authenticated:
+            self._auth_status = "Autenticado pelo GitHub CLI"
+            if username:
+                self._auth_status += f" como {username}"
+        else:
+            self._auth_status = "GitHub CLI não autenticado"
+        self.authStatusChanged.emit()
 
     @Slot()
     def reload(self) -> None:
@@ -87,9 +120,11 @@ class Backend(QObject):
     @Slot(str, str, result=bool)
     def createIdea(self, title: str, body: str) -> bool:
         try:
-            self._store.create(title, body)
+            created = self._store.create(title, body)
             self.reload()
             self._set_notice("Ideia criada em Entrada.")
+            relative = created.path.relative_to(self._store.vault).as_posix()
+            self._sync.request_save((relative,), f"ideia: criar {created.title}")
             return True
         except StorageError as exc:
             self._set_notice(str(exc))
@@ -98,13 +133,26 @@ class Backend(QObject):
     @Slot(str, str, str, str, str, result=bool)
     def saveIdea(self, idea_id: str, title: str, body: str, status: str, expected_hash: str) -> bool:
         try:
-            self._store.save_idea(idea_id, title, body, status, expected_hash)
+            current = {idea.idea_id: idea for idea in self._store.list_ideas()}[idea_id]
+            saved = self._store.save_idea(idea_id, title, body, status, expected_hash)
             self.reload()
             self._set_notice("Ideia salva.")
+            paths = (
+                current.path.relative_to(self._store.vault).as_posix(),
+                saved.path.relative_to(self._store.vault).as_posix(),
+            )
+            self._sync.request_save(paths, f"ideia: atualizar {saved.title}")
             return True
-        except StorageError as exc:
+        except (KeyError, StorageError) as exc:
             self._set_notice(str(exc))
             return False
+
+    @Slot()
+    def syncNow(self) -> None:
+        self._sync.request_sync()
+
+    def close(self) -> None:
+        self._sync.close()
 
     @Slot(str, result=str)
     def safePreviewMarkdown(self, markdown: str) -> str:

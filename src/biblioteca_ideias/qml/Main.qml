@@ -60,6 +60,20 @@ Kirigami.ApplicationWindow {
             spacing: Kirigami.Units.smallSpacing
             Controls.Label { text: "Biblioteca de Ideias"; font.bold: true; font.pixelSize: 20 }
             Item { Layout.fillWidth: true }
+            Controls.Label {
+                text: backend.syncStatus
+                color: backend.syncStatus === "Sincronizado"
+                       ? Kirigami.Theme.positiveTextColor
+                       : (backend.syncStatus === "Conflito precisa de atenção"
+                          || backend.syncStatus === "Erro dados locais salvos")
+                         ? Kirigami.Theme.negativeTextColor
+                         : Kirigami.Theme.neutralTextColor
+            }
+            Controls.Button {
+                text: "Sincronizar"
+                enabled: backend.syncStatus !== "Sincronizando"
+                onClicked: backend.syncNow()
+            }
             Controls.Button { text: "Configurações"; onClicked: settingsDialog.open() }
             Controls.Button { text: "Recarregar"; onClicked: backend.reload() }
             Controls.Button { text: "Nova ideia"; highlighted: true; onClicked: root.openEditor(null) }
@@ -317,6 +331,7 @@ Kirigami.ApplicationWindow {
             }
             Controls.Label { text: "Quantidade de ideias: " + backend.ideaCount }
             Controls.Label { text: backend.syncStatus; color: Kirigami.Theme.disabledTextColor }
+            Controls.Label { text: backend.authStatus; color: Kirigami.Theme.disabledTextColor }
             Controls.Label {
                 Layout.fillWidth: true
                 text: "A localização do cofre é fixa neste incremento."
