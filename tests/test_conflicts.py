@@ -306,6 +306,70 @@ class ConflictResolutionTest(unittest.TestCase):
         self.assertEqual(git(self.local, "rev-parse", "HEAD"), local)
         self.assertEqual(git(self.bare, "rev-parse", "main"), remote)
 
+    def test_non_markdown_differences_abort_without_loss_or_push(self) -> None:
+        cases = ("remote-only", "local-only", "modified", "deleted", "renamed", "mode")
+        for case in cases:
+            with self.subTest(case=case):
+                if case != cases[0]:
+                    self.tearDown()
+                    self.setUp()
+                local_file = self.local / "apoio.txt"
+                remote_file = self.other / "apoio.txt"
+                if case in {"modified", "deleted", "renamed", "mode"}:
+                    local_file.write_text("igual\n", encoding="utf-8")
+                    git(self.local, "add", "apoio.txt")
+                    git(self.local, "commit", "-m", "auxiliar na base")
+                    git(self.local, "push", str(self.bare), "main")
+                    git(self.other, "pull", "--ff-only", str(self.bare), "main")
+                self.diverge()
+                if case == "remote-only":
+                    remote_file.write_text("somente remoto\n", encoding="utf-8")
+                elif case == "local-only":
+                    local_file.write_text("somente local\n", encoding="utf-8")
+                elif case == "modified":
+                    remote_file.write_text("modificado\n", encoding="utf-8")
+                elif case == "deleted":
+                    remote_file.unlink()
+                elif case == "renamed":
+                    remote_file.rename(self.other / "renomeado.txt")
+                elif case == "mode":
+                    remote_file.chmod(0o755)
+                for repo in (self.local, self.other):
+                    if git(repo, "status", "--porcelain"):
+                        git(repo, "add", "-A")
+                        git(repo, "commit", "-m", f"auxiliar {case}")
+                git(self.other, "push", str(self.bare), "main")
+                self.service.fetch()
+                local = git(self.local, "rev-parse", "HEAD")
+                remote = git(self.local, "rev-parse", "origin/main")
+                bare_before = git(self.bare, "rev-parse", "main")
+                local_tree_before = git(self.local, "ls-tree", "-r", "HEAD")
+                conflict_id = self.manager.prepare(local, remote)
+                with self.assertRaises(ConflictError):
+                    self.manager.choose(conflict_id, self.idea_id, "local")
+                self.assertEqual(git(self.local, "rev-parse", "HEAD"), local)
+                self.assertEqual(git(self.bare, "rev-parse", "main"), bare_before)
+                self.assertEqual(git(self.local, "ls-tree", "-r", "HEAD"), local_tree_before)
+                self.assertIsNone(self.service.ref(
+                    f"refs/recovery/conflict-{conflict_id}-result"
+                ))
+
+    def test_identical_non_markdown_tree_is_preserved(self) -> None:
+        self.diverge()
+        for repo in (self.local, self.other):
+            (repo / ".gitkeep").write_text("igual\n", encoding="utf-8")
+            (repo / "README").write_text("auxiliar\n", encoding="utf-8")
+            git(repo, "add", ".gitkeep", "README")
+            git(repo, "commit", "-m", "auxiliares idênticos")
+        git(self.other, "push", str(self.bare), "main")
+        self.service.fetch()
+        local = git(self.local, "rev-parse", "HEAD")
+        remote = git(self.local, "rev-parse", "origin/main")
+        conflict_id = self.manager.prepare(local, remote)
+        self.manager.choose(conflict_id, self.idea_id, "local")
+        self.assertEqual((self.local / ".gitkeep").read_text(encoding="utf-8"), "igual\n")
+        self.assertEqual((self.local / "README").read_text(encoding="utf-8"), "auxiliar\n")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -141,6 +141,23 @@ class ConflictManager:
             names[name_key] = path
         return ideas
 
+    def _non_markdown_snapshot(self, commit: str) -> dict[str, tuple[str, str, str]]:
+        tree = self._git_bytes(("ls-tree", "-r", "-z", commit, "--"))
+        entries: dict[str, tuple[str, str, str]] = {}
+        for record in tree.split(b"\0"):
+            if not record:
+                continue
+            try:
+                metadata, raw_path = record.split(b"\t", 1)
+                mode, kind, object_id = metadata.decode("ascii").split(" ")
+                path = raw_path.decode("utf-8", "strict")
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise ConflictError("O histórico contém entrada auxiliar inválida.") from exc
+            if path.endswith(".md"):
+                continue
+            entries[path] = (mode, kind, object_id)
+        return entries
+
     def prepare(self, local: str, remote: str) -> str:
         for manifest_path in self.state_dir.glob("*/manifest.json"):
             try:
@@ -385,6 +402,17 @@ class ConflictManager:
             raise ConflictError("O repositório mudou desde a análise. As escolhas foram preservadas.")
 
         local_snapshot = self._snapshot(local)
+        base_non_markdown = self._non_markdown_snapshot(str(manifest["base"]))
+        local_non_markdown = self._non_markdown_snapshot(local)
+        remote_non_markdown = self._non_markdown_snapshot(remote)
+        # A base é lida para que corrupção em qualquer uma das três árvores seja
+        # detectada; somente os lados finais precisam ser exatamente idênticos.
+        del base_non_markdown
+        if local_non_markdown != remote_non_markdown:
+            raise ConflictError(
+                "Arquivos auxiliares diferem entre a versão local e o GitHub; "
+                "a recuperação foi preservada para revisão manual."
+            )
         result: dict[str, SnapshotIdea] = dict(local_snapshot)
         choices = manifest["choices"]
         assert isinstance(choices, dict)
@@ -466,15 +494,9 @@ class ConflictManager:
         index.unlink(missing_ok=True)
         self._git_bytes(("read-tree", "--empty"), index=index)
         # Preserva arquivos não-Markdown rastreados do lado local.
-        tree = self._git_bytes(("ls-tree", "-r", "-z", local, "--"))
-        for record in tree.split(b"\0"):
-            if not record:
-                continue
-            metadata, raw_path = record.split(b"\t", 1)
-            mode, kind, blob = metadata.decode().split(" ")
-            path = raw_path.decode("utf-8")
+        for path, (mode, kind, blob) in local_non_markdown.items():
             if kind != "blob" or path.endswith(".md"):
-                continue
+                raise ConflictError("O histórico contém arquivo auxiliar não regular.")
             if mode not in {"100644", "100755"}:
                 raise ConflictError("O histórico contém arquivo não regular.")
             self._git_bytes(("update-index", "--add", "--cacheinfo", f"{mode},{blob},{path}"), index=index)
