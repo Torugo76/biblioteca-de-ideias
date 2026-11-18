@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import threading
+from contextlib import contextmanager
 from urllib.parse import unquote, unquote_plus
 from dataclasses import dataclass
 from pathlib import Path
@@ -103,10 +104,25 @@ class GitService:
 
     def _environment(self) -> dict[str, str]:
         environment = os.environ.copy()
+        for key in tuple(environment):
+            if (
+                key in {
+                    "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_DIR", "GIT_WORK_TREE",
+                    "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                }
+                or key.startswith("GIT_CONFIG_KEY_")
+                or key.startswith("GIT_CONFIG_VALUE_")
+            ):
+                environment.pop(key, None)
         environment.update(
             {
                 "GIT_TERMINAL_PROMPT": "0",
                 "GCM_INTERACTIVE": "Never",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_COUNT": "0",
                 "LC_ALL": "C",
             }
         )
@@ -168,16 +184,20 @@ class GitService:
         return any(True for _ in records)
 
     def fetch(self) -> CommandResult:
-        destination = self.validate_destination()
-        if destination is None:
-            return CommandResult(125, "", "destino remoto não validado")
-        return self.run(
-            (
-                "fetch", "--no-tags", destination.fetch_url,
-                f"+refs/heads/{destination.branch}:refs/remotes/origin/{destination.branch}",
-            ),
-            timeout=max(self.timeout, 30),
-        )
+        with self._network_config_guard() as guard_error:
+            if guard_error:
+                return CommandResult(125, "", guard_error)
+            destination = self._validated_snapshot()
+            if destination is None:
+                return CommandResult(125, "", "destino remoto não validado")
+            return self._run_network(
+                destination.fetch_url,
+                (
+                    "fetch", "--no-tags", destination.fetch_url,
+                    f"+refs/heads/{destination.branch}:refs/remotes/origin/{destination.branch}",
+                ),
+                timeout=max(self.timeout, 30),
+            )
 
     def ref(self, name: str) -> str | None:
         result = self.run(("rev-parse", "--verify", name))
@@ -219,20 +239,97 @@ class GitService:
         return False
 
     def push(self) -> CommandResult:
-        destination = self.validate_destination()
-        if destination is None:
-            return CommandResult(125, "", "destino remoto não validado")
-        return self.run(
-            ("push", destination.push_url, f"HEAD:refs/heads/{destination.branch}"),
-            timeout=max(self.timeout, 30),
-        )
+        with self._network_config_guard() as guard_error:
+            if guard_error:
+                return CommandResult(125, "", guard_error)
+            destination = self._validated_snapshot()
+            if destination is None:
+                return CommandResult(125, "", "destino remoto não validado")
+            return self._run_network(
+                destination.push_url,
+                ("push", destination.push_url, f"HEAD:refs/heads/{destination.branch}"),
+                timeout=max(self.timeout, 30),
+            )
 
     def validate_destination(self) -> ValidatedDestination | None:
+        with self._network_config_guard() as guard_error:
+            if guard_error:
+                return None
+            return self._validated_snapshot()
+
+    def _validated_snapshot(self) -> ValidatedDestination | None:
         if self._destination_validator is not None:
             if not self._destination_validator():
                 return None
             return self._capture_destination(require_official=False, verify_metadata=False)
         return self._capture_destination(require_official=True, verify_metadata=True)
+
+    def _run_network(
+        self,
+        approved_url: str,
+        args: Iterable[str],
+        *,
+        timeout: float,
+    ) -> CommandResult:
+        identity_options = (
+            "-c", f"url.{approved_url}.insteadOf={approved_url}",
+            "-c", f"url.{approved_url}.pushInsteadOf={approved_url}",
+        )
+        return self.run((*identity_options, *tuple(args)), timeout=timeout)
+
+    @contextmanager
+    def _network_config_guard(self):
+        lock_paths: list[Path] = []
+        try:
+            for config_name in ("config", "config.worktree"):
+                path_result = self.run(("rev-parse", "--git-path", config_name))
+                if path_result.returncode != 0:
+                    yield "configuração Git não pôde ser protegida"
+                    return
+                config_path = Path(path_result.stdout.strip())
+                if not config_path.is_absolute():
+                    config_path = self.repo / config_path
+                lock_path = config_path.with_name(config_path.name + ".lock")
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                except FileExistsError:
+                    yield "configuração Git ocupada por outro processo"
+                    return
+                else:
+                    os.close(descriptor)
+                    lock_paths.append(lock_path)
+
+            unsafe = False
+            for scope in ("--local", "--worktree"):
+                keys = self.run(
+                    ("config", scope, "--no-includes", "--name-only", "--get-regexp", ".*")
+                )
+                if keys.returncode not in (0, 1):
+                    yield "configuração Git local não pôde ser auditada"
+                    return
+                for key in keys.stdout.splitlines():
+                    normalized = key.strip().casefold()
+                    if (
+                        normalized == "include.path"
+                        or (normalized.startswith("includeif.") and normalized.endswith(".path"))
+                        or (normalized.startswith("url.") and normalized.endswith(".insteadof"))
+                        or (normalized.startswith("url.") and normalized.endswith(".pushinsteadof"))
+                    ):
+                        unsafe = True
+                        break
+                if unsafe:
+                    break
+            if unsafe:
+                yield "configuração Git contém redirecionamento de URL não permitido"
+                return
+            yield None
+        finally:
+            for lock_path in reversed(lock_paths):
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
 
     def _capture_destination(
         self,

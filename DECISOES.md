@@ -13,6 +13,7 @@
 - Fast-forward revalida árvore/index e locks relevantes antes de usar `merge --ff-only --no-edit` com `merge.autoStash=false`; apesar do nome do comando, somente avanço linear é aceito, sem commit de merge, autostash ou resolução de divergência.
 - Cada salvamento local enfileira origem e destino exatos; staged externo bloqueia automação.
 - Todo fetch/push exige URL de fetch oficial, exatamente um destino de push oficial, branch `main` e confirmação em sessão de que `Torugo76/biblioteca-de-ideias-cofre` é privado. As URLs aprovadas são capturadas num snapshot imutável e passadas diretamente ao Git; uma troca posterior de `origin` não altera a operação em curso.
+- Operações de rede ignoram configurações Git system/global, recusam regras locais `insteadOf`/`pushInsteadOf` e includes, e mantêm `config.lock`/`config.worktree.lock` durante a captura e o subprocesso. Overrides de identidade da URL aprovada são aplicados como defesa adicional. Escritas diretas que deliberadamente ignorem os locks do Git ficam fora do modelo de concorrência suportado.
 - Falha de commit executa `restore --staged` somente nos pathspecs exatos da operação e nunca altera o worktree.
 - O app nunca sobrescreve silenciosamente uma edição externa.
 - O corpo Markdown integral é canônico; trechos dos cartões são derivados sem regravar o arquivo.

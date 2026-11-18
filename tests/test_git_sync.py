@@ -474,6 +474,9 @@ class GitServiceSafetyTest(unittest.TestCase):
         self.assertFalse(options["shell"])
         self.assertEqual(options["stdin"], subprocess.DEVNULL)
         self.assertEqual(options["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(options["env"]["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(options["env"]["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(options["env"]["GIT_CONFIG_COUNT"], "0")
 
     @patch("biblioteca_ideias.git_sync.subprocess.run", side_effect=subprocess.TimeoutExpired("git", 1))
     def test_timeout_is_bounded_and_sanitized(self, _run) -> None:
@@ -570,29 +573,44 @@ class GitServiceSafetyTest(unittest.TestCase):
             root = Path(temporary)
             approved = root / "approved.git"
             false_remote = root / "false.git"
+            seed = root / "seed"
             repo = root / "repo"
             git(root, "init", "--bare", "--initial-branch=main", str(approved))
             git(root, "init", "--bare", "--initial-branch=main", str(false_remote))
-            git(root, "clone", str(approved), str(repo))
+            git(root, "clone", str(approved), str(seed))
+            git(seed, "config", "user.name", "Teste")
+            git(seed, "config", "user.email", "teste@example.invalid")
+            (seed / "ideia.md").write_text("segura\n", encoding="utf-8")
+            git(seed, "add", "--", "ideia.md")
+            git(seed, "commit", "-m", "segura")
+            git(seed, "push", "origin", "main")
+            git(root, "clone", "--branch", "main", str(approved), str(repo))
             git(repo, "config", "user.name", "Teste")
             git(repo, "config", "user.email", "teste@example.invalid")
-            (repo / "ideia.md").write_text("segura\n", encoding="utf-8")
+            (repo / "ideia.md").write_text("nova\n", encoding="utf-8")
             git(repo, "add", "--", "ideia.md")
             git(repo, "commit", "-m", "segura")
 
             class SwappingPushService(GitService):
                 swapped = False
+                mutation_returncode = None
 
                 def run(inner_self, args, timeout=None):
-                    if args and args[0] == "push" and not inner_self.swapped:
+                    if "push" in args and not inner_self.swapped:
                         inner_self.swapped = True
-                        git(repo, "remote", "set-url", "--add", "--push", "origin", false_remote.as_uri())
+                        mutation = subprocess.run(
+                            ["git", "remote", "set-url", "--add", "--push", "origin", false_remote.as_uri()],
+                            cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            check=False, shell=False,
+                        )
+                        inner_self.mutation_returncode = mutation.returncode
                     return super().run(args, timeout)
 
             service = SwappingPushService(repo, destination_validator=lambda: True)
             result = service.push()
             self.assertEqual(result.returncode, 0)
             self.assertTrue(service.swapped)
+            self.assertNotEqual(service.mutation_returncode, 0)
             self.assertEqual(
                 git(approved, "rev-parse", "refs/heads/main"),
                 git(repo, "rev-parse", "HEAD"),
@@ -625,18 +643,174 @@ class GitServiceSafetyTest(unittest.TestCase):
 
             class SwappingFetchService(GitService):
                 swapped = False
+                mutation_returncode = None
 
                 def run(inner_self, args, timeout=None):
-                    if args and args[0] == "fetch" and not inner_self.swapped:
+                    if "fetch" in args and not inner_self.swapped:
                         inner_self.swapped = True
-                        git(repo, "remote", "set-url", "origin", false_remote.as_uri())
+                        mutation = subprocess.run(
+                            ["git", "remote", "set-url", "origin", false_remote.as_uri()],
+                            cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            check=False, shell=False,
+                        )
+                        inner_self.mutation_returncode = mutation.returncode
                     return super().run(args, timeout)
 
             service = SwappingFetchService(repo, destination_validator=lambda: True)
             result = service.fetch()
             self.assertEqual(result.returncode, 0)
             self.assertTrue(service.swapped)
+            self.assertNotEqual(service.mutation_returncode, 0)
             self.assertEqual(git(repo, "rev-parse", "origin/main"), approved_head)
+
+    def test_local_url_rewrites_and_includes_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            approved = root / "approved.git"
+            false_remote = root / "false.git"
+            repo = root / "repo"
+            git(root, "init", "--bare", "--initial-branch=main", str(approved))
+            git(root, "init", "--bare", "--initial-branch=main", str(false_remote))
+            git(root, "clone", str(approved), str(repo))
+            approved_url = approved.as_uri()
+            git(repo, "config", f"url.{false_remote.as_uri()}.insteadOf", approved_url)
+            service = GitService(repo, destination_validator=lambda: True)
+            result = service.fetch()
+            self.assertEqual(result.returncode, 125)
+            self.assertIn("redirecionamento", result.stderr)
+
+            git(repo, "config", "--unset-all", f"url.{false_remote.as_uri()}.insteadOf")
+            include_file = root / "included.conf"
+            include_file.write_text(
+                f"[url \"{false_remote.as_uri()}\"]\n\tinsteadOf = {approved_url}\n",
+                encoding="utf-8",
+            )
+            git(repo, "config", "include.path", str(include_file))
+            included = service.fetch()
+            self.assertEqual(included.returncode, 125)
+            self.assertIn("redirecionamento", included.stderr)
+
+    def test_global_and_system_url_rewrites_are_isolated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            approved = root / "approved.git"
+            false_remote = root / "false.git"
+            repo = root / "repo"
+            seed = root / "seed"
+            git(root, "init", "--bare", "--initial-branch=main", str(approved))
+            git(root, "init", "--bare", "--initial-branch=main", str(false_remote))
+            git(root, "clone", str(approved), str(seed))
+            git(seed, "config", "user.name", "Teste")
+            git(seed, "config", "user.email", "teste@example.invalid")
+            (seed / "segura.md").write_text("segura\n", encoding="utf-8")
+            git(seed, "add", "--", "segura.md")
+            git(seed, "commit", "-m", "segura")
+            git(seed, "push", "origin", "main")
+            git(root, "clone", "--branch", "main", str(approved), str(repo))
+            malicious_config = root / "malicious.conf"
+            malicious_config.write_text(
+                f"[url \"{false_remote.as_uri()}\"]\n"
+                f"\tinsteadOf = {approved.as_uri()}\n"
+                f"\tpushInsteadOf = {approved.as_uri()}\n",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {"GIT_CONFIG_GLOBAL": str(malicious_config), "GIT_CONFIG_SYSTEM": str(malicious_config)},
+            ):
+                service = GitService(repo, destination_validator=lambda: True)
+                self.assertEqual(service.fetch().returncode, 0)
+                git(repo, "config", "user.name", "Teste")
+                git(repo, "config", "user.email", "teste@example.invalid")
+                (repo / "local.md").write_text("local\n", encoding="utf-8")
+                git(repo, "add", "--", "local.md")
+                git(repo, "commit", "-m", "local")
+                self.assertEqual(service.push().returncode, 0)
+            self.assertEqual(
+                git(repo, "rev-parse", "origin/main"),
+                git(approved, "rev-parse", "refs/heads/main"),
+            )
+            self.assertEqual(git(repo, "rev-parse", "HEAD"), git(approved, "rev-parse", "refs/heads/main"))
+            false_ref = subprocess.run(
+                ["git", "rev-parse", "--verify", "refs/heads/main"], cwd=false_remote,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, shell=False,
+            )
+            self.assertNotEqual(false_ref.returncode, 0)
+
+    def test_environment_config_injection_is_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            approved = root / "approved.git"
+            false_remote = root / "false.git"
+            seed = root / "seed"
+            repo = root / "repo"
+            git(root, "init", "--bare", "--initial-branch=main", str(approved))
+            git(root, "init", "--bare", "--initial-branch=main", str(false_remote))
+            git(root, "clone", str(approved), str(seed))
+            git(seed, "config", "user.name", "Teste")
+            git(seed, "config", "user.email", "teste@example.invalid")
+            (seed / "ideia.md").write_text("segura\n", encoding="utf-8")
+            git(seed, "add", "--", "ideia.md")
+            git(seed, "commit", "-m", "segura")
+            git(seed, "push", "origin", "main")
+            git(root, "clone", "--branch", "main", str(approved), str(repo))
+            injected = {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": f"url.{false_remote.as_uri()}.insteadOf",
+                "GIT_CONFIG_VALUE_0": approved.as_uri(),
+            }
+            with patch.dict(os.environ, injected):
+                service = GitService(repo, destination_validator=lambda: True)
+                self.assertEqual(service.fetch().returncode, 0)
+                effective = service._environment()
+            self.assertEqual(effective["GIT_CONFIG_COUNT"], "0")
+            self.assertNotIn("GIT_CONFIG_KEY_0", effective)
+            self.assertNotIn("GIT_CONFIG_VALUE_0", effective)
+
+    def test_concurrent_pushinstead_rewrite_is_blocked_by_config_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            approved = root / "approved.git"
+            false_remote = root / "false.git"
+            repo = root / "repo"
+            git(root, "init", "--bare", "--initial-branch=main", str(approved))
+            git(root, "init", "--bare", "--initial-branch=main", str(false_remote))
+            git(root, "clone", str(approved), str(repo))
+            git(repo, "config", "user.name", "Teste")
+            git(repo, "config", "user.email", "teste@example.invalid")
+            (repo / "ideia.md").write_text("segura\n", encoding="utf-8")
+            git(repo, "add", "--", "ideia.md")
+            git(repo, "commit", "-m", "segura")
+
+            class RacingRewriteService(GitService):
+                attempted = False
+                mutation_returncode = None
+
+                def run(inner_self, args, timeout=None):
+                    if "push" in args and not inner_self.attempted:
+                        inner_self.attempted = True
+                        mutation = subprocess.run(
+                            [
+                                "git", "config",
+                                f"url.{false_remote.as_uri()}.pushInsteadOf",
+                                approved.as_uri(),
+                            ],
+                            cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            check=False, shell=False,
+                        )
+                        inner_self.mutation_returncode = mutation.returncode
+                    return super().run(args, timeout)
+
+            service = RacingRewriteService(repo, destination_validator=lambda: True)
+            self.assertEqual(service.push().returncode, 0)
+            self.assertTrue(service.attempted)
+            self.assertNotEqual(service.mutation_returncode, 0)
+            self.assertEqual(git(repo, "rev-parse", "HEAD"), git(approved, "rev-parse", "refs/heads/main"))
+            false_ref = subprocess.run(
+                ["git", "rev-parse", "--verify", "refs/heads/main"], cwd=false_remote,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, shell=False,
+            )
+            self.assertNotEqual(false_ref.returncode, 0)
 
     @patch("biblioteca_ideias.git_sync.validate_github_repository_metadata", return_value=True)
     def test_validated_snapshot_contains_only_approved_urls(self, _metadata) -> None:
