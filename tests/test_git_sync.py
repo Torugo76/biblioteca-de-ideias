@@ -376,7 +376,7 @@ class GitIntegrationTest(unittest.TestCase):
         self.assertNotIn("segredo-query", combined)
         self.assertIn("falha", combined)
 
-    @patch("biblioteca_ideias.git_sync.shutil.which", return_value="/usr/bin/gh")
+    @patch("biblioteca_ideias.git_sync.resolve_system_executable", return_value="/usr/bin/gh")
     @patch("biblioteca_ideias.git_sync.subprocess.run")
     def test_github_cli_detection_uses_only_auth_status(self, run, _which) -> None:
         run.return_value = subprocess.CompletedProcess(
@@ -477,6 +477,24 @@ class GitServiceSafetyTest(unittest.TestCase):
         self.assertEqual(options["env"]["GIT_CONFIG_NOSYSTEM"], "1")
         self.assertEqual(options["env"]["GIT_CONFIG_GLOBAL"], os.devnull)
         self.assertEqual(options["env"]["GIT_CONFIG_COUNT"], "0")
+
+    def test_inherited_path_cannot_replace_git_gh_or_ssh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / "executed"
+            for name in ("git", "gh", "ssh"):
+                fake = root / name
+                fake.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 99\n", encoding="utf-8")
+                fake.chmod(0o755)
+            with patch.dict(os.environ, {"PATH": str(root)}):
+                service = GitService(Path("/tmp"))
+                environment = service._environment()
+                from biblioteca_ideias.git_sync import resolve_system_executable
+                resolved = {name: resolve_system_executable(name) for name in ("git", "gh", "ssh")}
+            self.assertEqual(service.git, "/usr/bin/git")
+            self.assertEqual(resolved, {"git": "/usr/bin/git", "gh": "/usr/bin/gh", "ssh": "/usr/bin/ssh"})
+            self.assertEqual(environment["PATH"], "/usr/bin:/bin:/usr/local/bin")
+            self.assertFalse(marker.exists())
 
     @patch("biblioteca_ideias.git_sync.subprocess.run")
     def test_network_command_pins_credential_and_ssh_helpers(self, run) -> None:
@@ -972,7 +990,7 @@ class GitServiceSafetyTest(unittest.TestCase):
             git(repo, "remote", "add", "origin", "https://usuario@github.com/Torugo76/biblioteca-de-ideias-cofre.git")
             self.assertFalse(GitService(repo).validate_destination())
 
-    @patch("biblioteca_ideias.git_sync.shutil.which", return_value="/usr/bin/gh")
+    @patch("biblioteca_ideias.git_sync.resolve_system_executable", return_value="/usr/bin/gh")
     @patch("biblioteca_ideias.git_sync.subprocess.run")
     def test_public_or_wrong_github_repository_metadata_is_rejected(self, run, _which) -> None:
         for metadata in (

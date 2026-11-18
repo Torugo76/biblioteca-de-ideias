@@ -4,7 +4,6 @@ import os
 import json
 import queue
 import re
-import shutil
 import subprocess
 import threading
 from contextlib import contextmanager
@@ -50,6 +49,25 @@ SAFE_ENV_KEYS = (
     "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
     "DBUS_SESSION_BUS_ADDRESS", "SSH_AUTH_SOCK",
 )
+SAFE_EXECUTABLE_DIRS = (Path("/usr/bin"), Path("/bin"), Path("/usr/local/bin"))
+SAFE_PATH = ":".join(str(path) for path in SAFE_EXECUTABLE_DIRS)
+
+
+def resolve_system_executable(name: str) -> str | None:
+    if not re.fullmatch(r"[A-Za-z0-9._+-]+", name):
+        return None
+    allowed_roots = tuple(path.resolve() for path in SAFE_EXECUTABLE_DIRS)
+    for directory in SAFE_EXECUTABLE_DIRS:
+        candidate = directory / name
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (FileNotFoundError, OSError, RuntimeError):
+            continue
+        if not any(resolved == root or resolved.is_relative_to(root) for root in allowed_roots):
+            continue
+        if resolved.is_file() and os.access(resolved, os.X_OK):
+            return str(resolved)
+    return None
 
 
 def safe_subprocess_environment(*, for_gh: bool = False) -> dict[str, str]:
@@ -60,7 +78,7 @@ def safe_subprocess_environment(*, for_gh: bool = False) -> dict[str, str]:
     }
     environment.update(
         {
-            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "PATH": SAFE_PATH,
             "LC_ALL": "C",
             "LANG": "C",
             "NO_COLOR": "1",
@@ -133,7 +151,7 @@ class GitService:
     ):
         self.repo = repo.resolve()
         self.timeout = timeout
-        self.git = shutil.which("git")
+        self.git = resolve_system_executable("git")
         self._destination_validator = destination_validator
         self._validated_destination: ValidatedDestination | None = None
 
@@ -295,10 +313,10 @@ class GitService:
             "-c", f"url.{approved_url}.pushInsteadOf={approved_url}",
             "-c", "credential.helper=",
         )
-        gh = shutil.which("gh", path=self._environment()["PATH"])
+        gh = resolve_system_executable("gh")
         if gh:
             identity_options += ("-c", f"credential.helper=!{gh} auth git-credential")
-        ssh = shutil.which("ssh", path=self._environment()["PATH"])
+        ssh = resolve_system_executable("ssh")
         if ssh:
             identity_options += (
                 "-c", f"core.sshCommand={ssh} -F /dev/null -o BatchMode=yes",
@@ -477,7 +495,7 @@ def classify_failure(result: CommandResult) -> str:
 
 def detect_github_cli(timeout: float = 5.0) -> tuple[bool, str | None]:
     environment = safe_subprocess_environment(for_gh=True)
-    gh = shutil.which("gh", path=environment["PATH"])
+    gh = resolve_system_executable("gh")
     if gh is None:
         return False, None
     try:
@@ -507,7 +525,7 @@ def detect_github_cli(timeout: float = 5.0) -> tuple[bool, str | None]:
 
 def validate_github_repository_metadata(timeout: float = 8.0) -> bool:
     environment = safe_subprocess_environment(for_gh=True)
-    gh = shutil.which("gh", path=environment["PATH"])
+    gh = resolve_system_executable("gh")
     if gh is None:
         return False
     try:
