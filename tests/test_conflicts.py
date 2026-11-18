@@ -226,6 +226,86 @@ class ConflictResolutionTest(unittest.TestCase):
                 self.assertEqual(git(self.bare, "rev-parse", "main"), remote_main)
                 self.assertTrue(self.manager.list_pending())
 
+    def test_markdown_outside_contract_is_never_ignored(self) -> None:
+        invalid_paths = ("raiz.md", "entrada/nivel/ideia.md", "desconhecida/ideia.md")
+        for invalid_path in invalid_paths:
+            with self.subTest(path=invalid_path):
+                if invalid_path != invalid_paths[0]:
+                    self.tearDown()
+                    self.setUp()
+                local, remote = self.diverge()
+                path = self.local / invalid_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("conteúdo que não pode sumir\n", encoding="utf-8")
+                git(self.local, "add", invalid_path)
+                git(self.local, "commit", "-m", "markdown fora do contrato")
+                invalid_commit = git(self.local, "rev-parse", "HEAD")
+                with self.assertRaises(ConflictError):
+                    self.manager.prepare(invalid_commit, remote)
+                self.assertEqual(git(self.local, "rev-parse", "HEAD"), invalid_commit)
+                self.assertEqual(path.read_text(encoding="utf-8"), "conteúdo que não pode sumir\n")
+                self.assertFalse(any("-result" in ref for ref in git(
+                    self.local, "for-each-ref", "--format=%(refname)", "refs/recovery"
+                ).splitlines()))
+
+    def test_retry_reuses_exact_built_result_and_recognizes_completed_push(self) -> None:
+        local, remote = self.diverge()
+        conflict_id = self.manager.prepare(local, remote)
+        stopped = {"done": False}
+
+        def crash_after_build(stage: str) -> None:
+            if stage == "pre_apply" and not stopped["done"]:
+                stopped["done"] = True
+                raise ConflictError("queda simulada")
+
+        self.manager._reconcile_hook = crash_after_build  # type: ignore[method-assign]
+        with self.assertRaises(ConflictError):
+            self.manager.choose(conflict_id, self.idea_id, "both")
+        directory, manifest = self.manager._manifest(conflict_id)
+        first_result = str(manifest["result"])
+        first_copy_id = manifest["choices"][self.idea_id]["copy_id"]
+        self.manager._reconcile_hook = lambda _stage: None  # type: ignore[method-assign]
+        self.manager.choose(conflict_id, self.idea_id, "both")
+        _, completed = self.manager._manifest(conflict_id)
+        self.assertEqual(completed["result"], first_result)
+        self.assertEqual(completed["choices"][self.idea_id]["copy_id"], first_copy_id)
+
+        # Simula queda após push, antes de persistir status resolved, e tracking já atualizado.
+        completed["status"] = "pending"
+        self.manager._write_manifest(directory, completed)
+        git(self.local, "update-ref", "refs/remotes/origin/main", first_result)
+        self.manager._push_locked = lambda _destination: self.fail("push duplicado")  # type: ignore[method-assign]
+        self.manager._reconcile(directory, completed)
+        self.assertEqual(self.manager._manifest(conflict_id)[1]["status"], "resolved")
+
+        # Tracking antigo: o fetch reconhece que o remoto já contém o resultado.
+        _, completed = self.manager._manifest(conflict_id)
+        completed["status"] = "pending"
+        self.manager._write_manifest(directory, completed)
+        git(self.local, "update-ref", "refs/remotes/origin/main", remote)
+        self.manager._reconcile(directory, completed)
+        self.assertEqual(git(self.local, "rev-parse", "origin/main"), first_result)
+        self.assertEqual(self.manager._manifest(conflict_id)[1]["status"], "resolved")
+
+    def test_result_ref_failure_aborts_before_manifest_apply_or_push(self) -> None:
+        local, remote = self.diverge()
+        conflict_id = self.manager.prepare(local, remote)
+        original_run = self.service.run
+
+        def fail_result_ref(args, timeout=None):
+            values = tuple(args)
+            if values[:1] == ("update-ref",) and values[1].endswith("-result"):
+                return CommandResult(1, "", "falha simulada")
+            return original_run(values, timeout)
+
+        self.service.run = fail_result_ref  # type: ignore[method-assign]
+        with self.assertRaises(ConflictError):
+            self.manager.choose(conflict_id, self.idea_id, "local")
+        _, manifest = self.manager._manifest(conflict_id)
+        self.assertNotIn("result", manifest)
+        self.assertEqual(git(self.local, "rev-parse", "HEAD"), local)
+        self.assertEqual(git(self.bare, "rev-parse", "main"), remote)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -67,7 +67,9 @@ O aplicativo usa uma fila FIFO única em uma thread dedicada; a interface não e
 - somente depois de escolhas explícitas para todas as ideias o aplicativo monta um commit de reconciliação em índice temporário, com os dois ancestrais; rebase, reset, checkout destrutivo e force-push são proibidos;
 - antes de aplicar e enviar a reconciliação, o aplicativo confirma que checkout e GitHub continuam nos commits analisados; uma mudança concorrente interrompe a operação e preserva escolhas e backups;
 - o Markdown resultante é serializado pelo mesmo contrato do armazenamento e validado integralmente antes de criar objetos ou commits; o limite de 2 MB inclui front matter e corpo;
+- qualquer caminho `.md` da árvore precisa estar diretamente em uma coluna válida e ter nome compatível com seu título; Markdown na raiz, aninhado ou em coluna desconhecida interrompe a reconciliação sem ser apagado;
 - imediatamente antes de aplicar e novamente antes de enviar, HEAD, `origin/main`, status completo (incluindo staged, unstaged e não rastreados), locks, configuração e o snapshot do remoto são revalidados;
+- retomadas reutilizam o mesmo commit, UUID e timestamp guardados. Se o GitHub já confirmou esse commit, o manifesto é apenas marcado como resolvido, sem novo commit ou push;
 - falta de rede mantém o commit local como envio pendente;
 - falhas de Git não desfazem o Markdown salvo localmente;
 - falha de commit remove do índice somente os caminhos adicionados pela operação, sem tocar no worktree ou em staged externo;

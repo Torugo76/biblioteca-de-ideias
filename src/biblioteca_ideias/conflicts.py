@@ -124,10 +124,14 @@ class ConflictManager:
                 continue
             path = raw_path.decode("utf-8", "strict")
             parts = Path(path).parts
-            if len(parts) != 2 or parts[0] not in COLUMN_KEYS or not path.endswith(".md"):
+            if not path.endswith(".md"):
                 continue
+            if len(parts) != 2 or parts[0] not in COLUMN_KEYS:
+                raise ConflictError("O histórico contém Markdown fora das colunas permitidas.")
             data = self._git_bytes(("show", f"{commit}:{path}"))
             idea = self._parse_blob(path, data)
+            if title_filename(idea.title) != Path(path).name:
+                raise ConflictError("O histórico contém nome de Markdown incompatível com o título.")
             if idea.idea_id in ideas:
                 raise ConflictError("O histórico contém UUID duplicado.")
             name_key = filename_key(Path(path).name)
@@ -292,9 +296,26 @@ class ConflictManager:
             self._validate_result_bytes(candidate, f"{status}/{title_filename(title)}")
         choices = manifest.setdefault("choices", {})
         assert isinstance(choices, dict)
-        choices[idea_id] = {
+        previous_choice = choices.get(idea_id)
+        choice = {
             "action": action, "title": title, "body": body, "status": status,
         }
+        if action == "combined":
+            if isinstance(previous_choice, dict) and all(
+                previous_choice.get(key) == choice[key]
+                for key in ("action", "title", "body", "status")
+            ):
+                choice["updated_at"] = previous_choice.get("updated_at")
+            else:
+                choice["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        elif action == "both":
+            if isinstance(previous_choice, dict) and previous_choice.get("action") == "both":
+                choice["copy_id"] = previous_choice.get("copy_id")
+                choice["copy_updated_at"] = previous_choice.get("copy_updated_at")
+            else:
+                choice["copy_id"] = str(uuid.uuid4())
+                choice["copy_updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        choices[idea_id] = choice
         self._write_manifest(directory, manifest)
         if len(choices) < len(item_ids):
             return "Escolha registrada. Ainda existem conflitos pendentes."
@@ -358,19 +379,9 @@ class ConflictManager:
         destination = self.service.validate_destination()
         if destination is None:
             raise ConflictError("O destino Git não pôde ser validado; as escolhas foram preservadas.")
-        if head == previous_result and tracked_remote == remote and status.returncode == 0 and not records:
-            self._reconcile_hook("pre_retry_push")
-            with self.service._network_config_guard() as guard_error:
-                if guard_error:
-                    raise ConflictError("O repositório está ocupado; as escolhas foram preservadas.")
-                self._assert_repository_snapshot(previous_result, remote, destination)
-                pushed = self._push_locked(destination)
-            if pushed.returncode != 0:
-                raise ConflictError("A resolução ficou salva localmente e o envio está pendente.")
-            manifest["status"] = "resolved"
-            self._write_manifest(directory, manifest)
-            return
-        if head != local or tracked_remote != remote or status.returncode != 0 or records:
+        allowed_heads = {local} | ({previous_result} if previous_result else set())
+        allowed_remotes = {remote} | ({previous_result} if previous_result else set())
+        if head not in allowed_heads or tracked_remote not in allowed_remotes or status.returncode != 0 or records:
             raise ConflictError("O repositório mudou desde a análise. As escolhas foram preservadas.")
 
         local_snapshot = self._snapshot(local)
@@ -391,9 +402,15 @@ class ConflictManager:
                 selected = local_idea or remote_idea
                 duplicate = remote_idea if local_idea and remote_idea else None
                 if duplicate is not None:
-                    copy_id = str(uuid.uuid4())
+                    copy_id = str(choice.get("copy_id") or "")
+                    copy_updated = str(choice.get("copy_updated_at") or "")
+                    try:
+                        copy_id = str(uuid.UUID(copy_id))
+                    except ValueError as exc:
+                        raise ConflictError("A recuperação da cópia possui UUID inválido.") from exc
+                    if not copy_updated:
+                        raise ConflictError("A recuperação da cópia possui data inválida.")
                     copy_title = duplicate.title + " (GitHub)"
-                    copy_updated = datetime.now().astimezone().isoformat(timespec="seconds")
                     data = MarkdownStore._serialize(
                         copy_id, copy_title, duplicate.body, duplicate.created_at,
                         copy_updated,
@@ -408,7 +425,9 @@ class ConflictManager:
                     raise ConflictError("Não há versão para combinar.")
                 title = str(choice["title"])
                 status_name = str(choice["status"])
-                combined_updated = datetime.now().astimezone().isoformat(timespec="seconds")
+                combined_updated = str(choice.get("updated_at") or "")
+                if not combined_updated:
+                    raise ConflictError("A recuperação combinada possui data inválida.")
                 data = MarkdownStore._serialize(
                     idea_id, title, str(choice["body"]), source.created_at,
                     combined_updated,
@@ -471,21 +490,64 @@ class ConflictManager:
                 index=index,
             )
         tree_id = self._git_bytes(("write-tree",), index=index).decode().strip()
-        commit = self._git_bytes(
-            (
-                "-c", "user.name=Biblioteca de Ideias",
-                "-c", "user.email=Torugo76@users.noreply.github.com",
-                "commit-tree", tree_id, "-p", local, "-p", remote,
-                "-m", "conflito: reconciliar escolhas explícitas",
-            )
-        ).decode().strip()
-        self.service.run(("update-ref", f"refs/recovery/conflict-{manifest['id']}-result", commit))
+        result_ref = f"refs/recovery/conflict-{manifest['id']}-result"
+        ref_result = self.service.ref(result_ref)
+        recorded_tree = str(manifest.get("result_tree") or "")
+        if recorded_tree and recorded_tree != tree_id:
+            raise ConflictError("A árvore da recuperação não corresponde às escolhas salvas.")
+        if previous_result and ref_result != previous_result:
+            raise ConflictError("A referência da recuperação resultante não corresponde ao manifesto.")
+        commit = previous_result or ref_result or ""
+        if commit:
+            parents = self._git_bytes(("rev-list", "--parents", "-n", "1", commit)).decode().split()
+            commit_tree = self._git_bytes(("show", "-s", "--format=%T", commit)).decode().strip()
+            if parents != [commit, local, remote] or commit_tree != tree_id:
+                raise ConflictError("O commit de recuperação não corresponde às escolhas salvas.")
+        else:
+            commit = self._git_bytes(
+                (
+                    "-c", "user.name=Biblioteca de Ideias",
+                    "-c", "user.email=Torugo76@users.noreply.github.com",
+                    "commit-tree", tree_id, "-p", local, "-p", remote,
+                    "-m", "conflito: reconciliar escolhas explícitas",
+                )
+            ).decode().strip()
+            updated = self.service.run(("update-ref", result_ref, commit))
+            if updated.returncode != 0:
+                raise ConflictError("Não foi possível registrar o resultado na recuperação local.")
         manifest["result"] = commit
+        manifest["result_tree"] = tree_id
         self._write_manifest(directory, manifest)
 
+        # Um crash após o push pode deixar apenas o manifesto pendente. Nesse caso,
+        # reconhecer o estado confirmado é suficiente; não se cria nem envia nada novo.
+        if head == commit and tracked_remote == commit:
+            self._assert_repository_snapshot(commit, commit, destination)
+            manifest["status"] = "resolved"
+            self._write_manifest(directory, manifest)
+            return
+
         fetched = self.service.fetch()
-        if fetched.returncode != 0 or self.service.ref("origin/main") != remote:
+        fetched_remote = self.service.ref("origin/main")
+        if fetched.returncode != 0 or fetched_remote not in {remote, commit}:
             raise ConflictError("O GitHub mudou durante a resolução. Nada foi aplicado ao checkout.")
+        if head == commit and fetched_remote == commit:
+            self._assert_repository_snapshot(commit, commit, destination)
+            manifest["status"] = "resolved"
+            self._write_manifest(directory, manifest)
+            return
+        if head == commit and fetched_remote == remote:
+            self._reconcile_hook("pre_retry_push")
+            with self.service._network_config_guard() as guard_error:
+                if guard_error:
+                    raise ConflictError("O repositório está ocupado; as escolhas foram preservadas.")
+                self._assert_repository_snapshot(commit, remote, destination)
+                pushed = self._push_locked(destination)
+            if pushed.returncode != 0:
+                raise ConflictError("A resolução ficou salva localmente e o envio está pendente.")
+            manifest["status"] = "resolved"
+            self._write_manifest(directory, manifest)
+            return
         self._reconcile_hook("pre_apply")
         with self.service._network_config_guard() as guard_error:
             if guard_error:

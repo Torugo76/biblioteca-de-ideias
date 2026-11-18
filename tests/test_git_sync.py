@@ -165,7 +165,7 @@ class GitIntegrationTest(unittest.TestCase):
         try:
             coordinator.request_sync()
             self.assertTrue(coordinator.wait_for_idle())
-            self.assertEqual(coordinator.state, STATE_CONFLICT)
+            self.assertEqual(coordinator.state, STATE_ERROR)
             self.assertEqual(git(self.a, "status", "--porcelain"), "")
             self.assertEqual(git(self.a, "diff", "--cached", "--name-only"), "")
         finally:
@@ -228,7 +228,8 @@ class GitIntegrationTest(unittest.TestCase):
         try:
             coordinator.request_sync()
             self.assertTrue(coordinator.wait_for_idle())
-            self.assertEqual(coordinator.state, STATE_CONFLICT)
+            # Markdown cru na raiz é erro de integridade, nunca conflito resolvível.
+            self.assertEqual(coordinator.state, STATE_ERROR)
             self.assertEqual(git(self.a, "rev-parse", "HEAD"), local_head)
             self.assertTrue((self.a / "local.md").exists())
         finally:
@@ -245,7 +246,7 @@ class GitIntegrationTest(unittest.TestCase):
         try:
             coordinator.request_save(("ideia.md",), "ideia: local")
             self.assertTrue(coordinator.wait_for_idle())
-            self.assertEqual(coordinator.state, STATE_CONFLICT)
+            self.assertEqual(coordinator.state, STATE_ERROR)
             self.assertNotEqual(git(self.a, "rev-parse", "HEAD"), remote_head)
             self.assertEqual(git(self.a, "rev-parse", "origin/main"), remote_head)
             self.assertEqual((self.a / "ideia.md").read_text(encoding="utf-8"), "local\n")
