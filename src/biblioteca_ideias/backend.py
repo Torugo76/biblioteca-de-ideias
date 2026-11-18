@@ -40,6 +40,7 @@ class Backend(QObject):
     authStatusChanged = Signal()
     readyChanged = Signal()
     githubEnabledChanged = Signal()
+    conflictsChanged = Signal()
 
     def __init__(
         self,
@@ -92,18 +93,62 @@ class Backend(QObject):
         auto_sync: bool,
     ) -> None:
         self._store = MarkdownStore(self._vault_path, state_dir=self._state_path)
-        self._sync = sync_coordinator or SyncCoordinator(self._vault_path, auto_sync=auto_sync)
+        self._sync = sync_coordinator or SyncCoordinator(
+            self._vault_path, auto_sync=auto_sync,
+            recovery_dir=self._state_path / "conflitos",
+        )
         self._sync.stateChanged.connect(self._on_sync_state)
         self._sync.authChanged.connect(self._on_auth_status)
         self._sync.repositoryUpdated.connect(
             self._reload_after_fast_forward, Qt.ConnectionType.QueuedConnection
         )
+        if hasattr(self._sync, "conflictDetected"):
+            self._sync.conflictDetected.connect(self._on_conflict_detected)
         self.reload()
         self.readyChanged.emit()
 
     @Property("QVariantList", notify=ideasChanged)
     def ideas(self) -> list[dict[str, str]]:
         return self._ideas
+
+    @Property("QVariantList", notify=conflictsChanged)
+    def conflicts(self) -> list[dict[str, object]]:
+        if self._sync is None or not hasattr(self._sync, "conflict_manager"):
+            return []
+        return self._sync.conflict_manager.list_pending()
+
+    @Slot(str)
+    def _on_conflict_detected(self, _conflict_id: str) -> None:
+        self.conflictsChanged.emit()
+        self._set_notice("Há versões diferentes da mesma ideia. Escolha como reconciliá-las.")
+
+    @Slot(str, str, str, result="QVariantMap")
+    def conflictVersion(self, conflict_id: str, idea_id: str, side: str) -> dict[str, str]:
+        try:
+            return self._sync.conflict_manager.version(conflict_id, idea_id, side)  # type: ignore[union-attr]
+        except Exception:
+            self._set_notice("Não foi possível abrir essa versão de recuperação.")
+            return {}
+
+    @Slot(str, str, str, str, str, str, result=bool)
+    def resolveConflict(self, conflict_id: str, idea_id: str, action: str,
+                        title: str, body: str, status: str) -> bool:
+        try:
+            message = self._sync.conflict_manager.choose(  # type: ignore[union-attr]
+                conflict_id, idea_id, action, title=title, body=body, status=status,
+            )
+            self.conflictsChanged.emit()
+            self.reload()
+            self._set_notice(message)
+            return True
+        except Exception as exc:
+            self.conflictsChanged.emit()
+            from .conflicts import ConflictError
+            self._set_notice(
+                str(exc) if isinstance(exc, ConflictError)
+                else "Não foi possível concluir a reconciliação; as cópias foram preservadas."
+            )
+            return False
 
     @Property("QVariantList", constant=True)
     def columns(self) -> list[dict[str, str]]:

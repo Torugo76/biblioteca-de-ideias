@@ -29,3 +29,11 @@
 - Sincronização remota, autenticação e criação de repositórios exigem uma autorização posterior.
 - O bootstrap de projetos consumirá o cofre por um contrato separado; não será embutido no MVP.
 
+# Incremento E — conflitos explícitos e recuperáveis
+
+- Divergência cria refs de recuperação e snapshots privados no estado XDG antes de pedir qualquer decisão.
+- A identidade de uma ideia é o UUID do front matter, não seu caminho; renomear e mover não quebram a comparação.
+- Nenhuma versão é escolhida automaticamente. Local, GitHub, ambas e combinação editada são decisões visíveis do usuário.
+- A árvore reconciliada é construída em índice temporário e validada antes de avançar o checkout; mudanças concorrentes abortam e preservam a recuperação.
+- Refs e snapshots não expiram automaticamente nesta versão. A limpeza é deliberadamente manual após conferência do push.
+

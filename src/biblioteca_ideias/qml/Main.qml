@@ -70,6 +70,12 @@ Kirigami.ApplicationWindow {
                          : Kirigami.Theme.neutralTextColor
             }
             Controls.Button {
+                text: "Resolver conflitos (" + backend.conflicts.length + ")"
+                visible: backend.conflicts.length > 0
+                highlighted: true
+                onClicked: conflictDialog.open()
+            }
+            Controls.Button {
                 text: "Sincronizar"
                 enabled: backend.ready && backend.githubEnabled && backend.syncStatus !== "Sincronizando"
                 onClicked: backend.syncNow()
@@ -307,6 +313,140 @@ Kirigami.ApplicationWindow {
             editorDialog.close()
         }
         Controls.Label { text: "Há alterações que ainda não foram salvas." }
+    }
+
+    Controls.Dialog {
+        id: conflictDialog
+        title: "Resolver versões diferentes"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(900, root.width - 48)
+        height: Math.min(720, root.height - 48)
+        contentItem: ColumnLayout {
+            Controls.Label {
+                Layout.fillWidth: true
+                text: "Nada é escolhido automaticamente. As cópias de recuperação permanecem guardadas."
+                wrapMode: Text.WordWrap
+                color: Kirigami.Theme.disabledTextColor
+            }
+            Controls.ScrollView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                ListView {
+                    id: conflictList
+                    model: backend.conflicts
+                    spacing: Kirigami.Units.largeSpacing
+                    delegate: Kirigami.Card {
+                        required property var modelData
+                        width: conflictList.width - Kirigami.Units.smallSpacing
+                        contentItem: ColumnLayout {
+                            Controls.Label {
+                                Layout.fillWidth: true
+                                text: modelData.titulo_local + " ↔ " + modelData.titulo_remoto
+                                font.bold: true
+                                wrapMode: Text.WordWrap
+                            }
+                            Controls.Label {
+                                Layout.fillWidth: true
+                                text: "Local: " + (modelData.data_local || "excluída")
+                                      + "  •  GitHub: " + (modelData.data_remota || "excluída")
+                                color: Kirigami.Theme.disabledTextColor
+                                wrapMode: Text.WordWrap
+                            }
+                            Controls.TextArea {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: 150
+                                text: modelData.diff || "Alteração de nome, coluna ou exclusão."
+                                readOnly: true
+                                selectByMouse: true
+                                wrapMode: TextEdit.NoWrap
+                            }
+                            Flow {
+                                Layout.fillWidth: true
+                                spacing: Kirigami.Units.smallSpacing
+                                Controls.Button {
+                                    text: "Manter versão local"
+                                    onClicked: backend.resolveConflict(modelData.conflito, modelData.id,
+                                                                       "local", "", "", "entrada")
+                                }
+                                Controls.Button {
+                                    text: "Manter versão GitHub"
+                                    onClicked: backend.resolveConflict(modelData.conflito, modelData.id,
+                                                                       "remote", "", "", "entrada")
+                                }
+                                Controls.Button {
+                                    text: "Manter ambas"
+                                    onClicked: backend.resolveConflict(modelData.conflito, modelData.id,
+                                                                       "both", "", "", "entrada")
+                                }
+                                Controls.Button {
+                                    text: "Editar versão combinada"
+                                    onClicked: {
+                                        var value = backend.conflictVersion(modelData.conflito, modelData.id, "local")
+                                        if (!value.titulo)
+                                            value = backend.conflictVersion(modelData.conflito, modelData.id, "remote")
+                                        combinedDialog.conflictId = modelData.conflito
+                                        combinedDialog.ideaId = modelData.id
+                                        combinedTitle.text = value.titulo || ""
+                                        combinedBody.text = value.corpo || ""
+                                        combinedStatus.currentIndex = Math.max(0, backend.columns.findIndex(
+                                            function(c) { return c.chave === value.status }))
+                                        combinedDialog.open()
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                Controls.Button { text: "Fechar"; onClicked: conflictDialog.close() }
+            }
+        }
+    }
+
+    Controls.Dialog {
+        id: combinedDialog
+        property string conflictId: ""
+        property string ideaId: ""
+        title: "Editar versão combinada"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(760, root.width - 64)
+        height: Math.min(620, root.height - 64)
+        contentItem: ColumnLayout {
+            Controls.TextField { id: combinedTitle; Layout.fillWidth: true; placeholderText: "Título" }
+            Controls.ComboBox {
+                id: combinedStatus
+                Layout.fillWidth: true
+                model: backend.columns
+                textRole: "titulo"
+            }
+            Controls.TextArea {
+                id: combinedBody
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                wrapMode: TextEdit.Wrap
+                placeholderText: "Conteúdo Markdown combinado"
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                Controls.Button { text: "Cancelar"; onClicked: combinedDialog.close() }
+                Controls.Button {
+                    text: "Usar combinação"
+                    highlighted: true
+                    onClicked: {
+                        if (backend.resolveConflict(combinedDialog.conflictId, combinedDialog.ideaId,
+                                                    "combined", combinedTitle.text, combinedBody.text,
+                                                    backend.columns[combinedStatus.currentIndex].chave))
+                            combinedDialog.close()
+                    }
+                }
+            }
+        }
     }
 
     Controls.Dialog {

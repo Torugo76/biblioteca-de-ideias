@@ -5,6 +5,7 @@ import json
 import queue
 import re
 import subprocess
+import tempfile
 import threading
 from contextlib import contextmanager
 from urllib.parse import unquote, unquote_plus
@@ -561,10 +562,18 @@ class SyncCoordinator(QObject):
     stateChanged = Signal(str)
     authChanged = Signal(bool, str)
     repositoryUpdated = Signal()
+    conflictDetected = Signal(str)
 
-    def __init__(self, repo: Path, auto_sync: bool = True, service: GitService | None = None):
+    def __init__(self, repo: Path, auto_sync: bool = True, service: GitService | None = None,
+                 recovery_dir: Path | None = None):
         super().__init__()
         self.service = service or GitService(repo)
+        from .conflicts import ConflictManager
+        state = recovery_dir or (
+            Path(tempfile.gettempdir()) / "biblioteca-de-ideias-conflitos" /
+            re.sub(r"[^A-Za-z0-9_.-]", "_", os.fspath(Path(repo).resolve()))
+        )
+        self.conflict_manager = ConflictManager(Path(repo), state, self.service)
         self._queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self._fetch_lock = threading.Lock()
         self._fetch_pending = False
@@ -641,6 +650,15 @@ class SyncCoordinator(QObject):
             return None, STATE_CONFLICT
         return records, None
 
+    def _record_divergence(self, local: str, remote: str) -> None:
+        try:
+            conflict_id = self.conflict_manager.prepare(local, remote)
+        except Exception:
+            self._set_state(STATE_ERROR)
+            return
+        self.conflictDetected.emit(conflict_id)
+        self._set_state(STATE_CONFLICT)
+
     def _sync(self) -> None:
         self._set_state(STATE_SYNCING)
         records, error = self._preflight()
@@ -671,7 +689,7 @@ class SyncCoordinator(QObject):
             pushed = self.service.push()
             self._set_state(STATE_SYNCED if pushed.returncode == 0 else classify_failure(pushed))
         else:
-            self._set_state(STATE_CONFLICT)
+            self._record_divergence(local, remote)
 
     def _save(self, paths: tuple[str, ...], message: str) -> None:
         self._set_state(STATE_SYNCING)
@@ -708,4 +726,4 @@ class SyncCoordinator(QObject):
             failure = classify_failure(pushed)
             self._set_state(STATE_SYNCED if pushed.returncode == 0 else (STATE_PENDING if failure == STATE_OFFLINE else failure))
         else:
-            self._set_state(STATE_CONFLICT)
+            self._record_divergence(local, remote)

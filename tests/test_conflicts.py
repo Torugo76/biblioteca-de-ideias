@@ -1,0 +1,157 @@
+from __future__ import annotations
+
+import os
+import stat
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+from biblioteca_ideias.conflicts import ConflictError, ConflictManager
+from biblioteca_ideias.git_sync import CommandResult, GitService
+from biblioteca_ideias.storage import MarkdownStore
+
+
+def git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["/usr/bin/git", *args], cwd=repo, check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1"},
+    )
+    return result.stdout.strip()
+
+
+class LocalService(GitService):
+    def __init__(self, repo: Path, remote: Path):
+        super().__init__(repo, destination_validator=lambda: True)
+        self.remote = remote
+
+    def fetch(self) -> CommandResult:
+        return self.run(("fetch", "--no-tags", str(self.remote),
+                         "+refs/heads/main:refs/remotes/origin/main"))
+
+    def push(self) -> CommandResult:
+        return self.run(("push", str(self.remote), "HEAD:refs/heads/main"))
+
+
+class ConflictResolutionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.bare = root / "vault.git"
+        self.seed = root / "seed"
+        self.local = root / "local"
+        self.other = root / "other"
+        self.state = root / "state"
+        git(root, "init", "--bare", str(self.bare))
+        self.seed.mkdir()
+        git(self.seed, "init", "-b", "main")
+        git(self.seed, "config", "user.name", "Teste")
+        git(self.seed, "config", "user.email", "teste@example.invalid")
+        store = MarkdownStore(self.seed, state_dir=root / "seed-state")
+        idea = store.create("Ideia principal", "base\n")
+        self.idea_id = idea.idea_id
+        git(self.seed, "add", ".")
+        git(self.seed, "commit", "-m", "base")
+        git(self.seed, "push", str(self.bare), "main")
+        git(root, "clone", "-b", "main", str(self.bare), str(self.local))
+        git(root, "clone", "-b", "main", str(self.bare), str(self.other))
+        for repo in (self.local, self.other):
+            git(repo, "config", "user.name", "Teste")
+            git(repo, "config", "user.email", "teste@example.invalid")
+        self.service = LocalService(self.local, self.bare)
+        self.manager = ConflictManager(self.local, self.state, self.service)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def diverge(self, *, local_body: str = "local\n", remote_body: str = "remoto\n",
+                local_title: str = "Ideia principal", remote_title: str = "Ideia principal",
+                local_status: str = "entrada", remote_status: str = "entrada") -> tuple[str, str]:
+        for repo, body, title, status in (
+            (self.local, local_body, local_title, local_status),
+            (self.other, remote_body, remote_title, remote_status),
+        ):
+            store = MarkdownStore(repo, state_dir=repo.parent / f"{repo.name}-state")
+            idea = {entry.idea_id: entry for entry in store.list_ideas()}[self.idea_id]
+            store.save_idea(self.idea_id, title, body, status, idea.content_hash)
+            git(repo, "add", ".")
+            git(repo, "commit", "-m", body.strip())
+        git(self.other, "push", str(self.bare), "main")
+        self.service.fetch()
+        return git(self.local, "rev-parse", "HEAD"), git(self.local, "rev-parse", "origin/main")
+
+    def test_prepare_uses_uuid_across_rename_move_and_is_private(self) -> None:
+        local, remote = self.diverge(
+            local_title="Renomeada", remote_title="Ideia principal",
+            local_status="planejada", remote_status="em-andamento",
+        )
+        before = git(self.local, "status", "--porcelain")
+        conflict_id = self.manager.prepare(local, remote)
+        self.assertEqual(before, git(self.local, "status", "--porcelain"))
+        pending = self.manager.list_pending()
+        self.assertEqual([self.idea_id], [entry["id"] for entry in pending])
+        self.assertEqual(conflict_id, self.manager.prepare(local, remote))
+        self.assertEqual(stat.S_IMODE(self.state.stat().st_mode), 0o700)
+        for path in (self.state / conflict_id).rglob("*"):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700 if path.is_dir() else 0o600)
+        self.assertEqual(git(self.local, "rev-parse", f"refs/recovery/conflict-{conflict_id}-local"), local)
+
+    def test_all_explicit_resolution_actions(self) -> None:
+        for action in ("local", "remote", "both", "combined"):
+            with self.subTest(action=action):
+                if action != "local":
+                    self.tearDown()
+                    self.setUp()
+                local, remote = self.diverge()
+                conflict_id = self.manager.prepare(local, remote)
+                kwargs = ({"title": "Combinada", "body": "texto combinado\n", "status": "avaliando"}
+                          if action == "combined" else {})
+                self.manager.choose(conflict_id, self.idea_id, action, **kwargs)
+                self.assertEqual(git(self.local, "rev-parse", "HEAD"), git(self.bare, "rev-parse", "main"))
+                ideas = MarkdownStore(self.local, state_dir=self.local.parent / "read-state").list_ideas()
+                if action == "both":
+                    self.assertEqual(len(ideas), 2)
+                    self.assertEqual(len({idea.idea_id for idea in ideas}), 2)
+                else:
+                    self.assertEqual(len(ideas), 1)
+                    expected = {"local": "local", "remote": "remoto", "combined": "texto combinado"}[action]
+                    self.assertIn(expected, ideas[0].body)
+                self.assertEqual(self.manager.list_pending(), [])
+
+    def test_remote_change_during_resolution_preserves_local_checkout(self) -> None:
+        local, remote = self.diverge()
+        conflict_id = self.manager.prepare(local, remote)
+        # Terceiro avanço remoto depois da análise.
+        git(self.other, "pull", "--ff-only", str(self.bare), "main")
+        store = MarkdownStore(self.other, state_dir=self.other.parent / "late-state")
+        store.create("Outra ideia", "mudança tardia\n")
+        git(self.other, "add", ".")
+        git(self.other, "commit", "-m", "mudança tardia")
+        git(self.other, "push", str(self.bare), "main")
+        with self.assertRaises(ConflictError):
+            self.manager.choose(conflict_id, self.idea_id, "local")
+        self.assertEqual(git(self.local, "rev-parse", "HEAD"), local)
+        self.assertTrue(self.manager.list_pending())
+
+    def test_invalid_yaml_and_duplicate_uuid_are_integrity_errors(self) -> None:
+        local, remote = self.diverge()
+        path = next(self.other.glob("*/*.md"))
+        text = path.read_text(encoding="utf-8")
+        path.write_text(text.replace("titulo:", "titulo: ["), encoding="utf-8")
+        git(self.other, "add", ".")
+        git(self.other, "commit", "-m", "yaml inválido")
+        with self.assertRaises(ConflictError):
+            self.manager._snapshot(git(self.other, "rev-parse", "HEAD"))
+        git(self.other, "checkout", "HEAD^", "--", str(path.relative_to(self.other)))
+        duplicate = self.other / "avaliando" / "duplicada.md"
+        duplicate.parent.mkdir(exist_ok=True)
+        duplicate.write_bytes(path.read_bytes())
+        git(self.other, "add", ".")
+        git(self.other, "commit", "-m", "uuid duplicado")
+        with self.assertRaises(ConflictError):
+            self.manager._snapshot(git(self.other, "rev-parse", "HEAD"))
+
+
+if __name__ == "__main__":
+    unittest.main()

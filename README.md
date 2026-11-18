@@ -14,6 +14,7 @@ Aplicativo desktop para Fedora KDE que organiza ideias em um quadro Kanban e gra
 - sincronização Git assíncrona ao abrir, manualmente e após cada salvamento;
 - instalação em outro computador por login oficial no navegador e clone validado do cofre privado existente;
 - estados claros para offline, autenticação, envio pendente e divergência;
+- resolução visual de divergências por ideia, com escolhas explícitas para manter a versão local, a versão do GitHub, ambas ou uma edição combinada;
 - gravação atômica com `QSaveFile`;
 - recusa de sobrescrita quando outro programa alterou o Markdown;
 - trava entre duas instâncias do aplicativo;
@@ -62,7 +63,9 @@ O aplicativo usa uma fila FIFO única em uma thread dedicada; a interface não e
 - subprocessos Git/`gh` usam `umask=077`; o armazenamento reaplica 0700 aos diretórios e remove bits de grupo/outros de todos os arquivos. Markdown, journals, configuração, refs e índice ficam normalmente 0600; objetos Git imutáveis podem ficar 0400;
 - executáveis `git`, `gh` e `ssh` são escolhidos apenas em diretórios de sistema fixos; o PATH do processo não pode substituí-los por wrappers;
 - o avanço revalida status/index e locks do índice/referência, então usa `merge --ff-only` com `merge.autoStash=false`; esse comando apenas move a referência em fast-forward, nunca cria commit de merge nem resolve divergências;
-- divergências nunca são combinadas: o único `merge` permitido é `--ff-only`, sem commit de merge, autostash ou resolução automática; rebase, reset e force-push são proibidos;
+- divergências nunca são decididas automaticamente: primeiro são criadas refs locais e cópias privadas de recuperação, e o conteúdo é comparado por UUID diretamente nas árvores Git, inclusive após renomear ou mover uma ideia;
+- somente depois de escolhas explícitas para todas as ideias o aplicativo monta um commit de reconciliação em índice temporário, com os dois ancestrais; rebase, reset, checkout destrutivo e force-push são proibidos;
+- antes de aplicar e enviar a reconciliação, o aplicativo confirma que checkout e GitHub continuam nos commits analisados; uma mudança concorrente interrompe a operação e preserva escolhas e backups;
 - falta de rede mantém o commit local como envio pendente;
 - falhas de Git não desfazem o Markdown salvo localmente;
 - falha de commit remove do índice somente os caminhos adicionados pela operação, sem tocar no worktree ou em staged externo;
@@ -73,6 +76,12 @@ O aplicativo usa uma fila FIFO única em uma thread dedicada; a interface não e
 
 O botão **Sincronizar** executa a atualização manual. A barra informa: Sincronizado, Sincronizando, Alterações locais, Envio pendente, Offline, Login necessário, Conflito precisa de atenção ou Erro dados locais salvos.
 
+### Recuperação de conflitos
+
+Ao detectar históricos divergentes, o aplicativo não altera o checkout. Ele cria referências em `refs/recovery/` e exporta snapshots Markdown por UUID para a pasta privada de estado XDG. YAML inválido, UUID repetido ou nomes incompatíveis interrompem a análise como erro de integridade.
+
+As referências, o manifesto e os snapshots são mantidos mesmo depois de uma resolução bem-sucedida para permitir auditoria e recuperação manual. Nesta versão não há limpeza automática por prazo: remova uma recuperação antiga somente após confirmar o conteúdo e o envio ao GitHub. Se a rede falhar depois da aplicação local, repetir a última escolha tenta apenas concluir o envio, sem recriar ou perder a reconciliação.
+
 ## Testes
 
 ```bash
@@ -82,6 +91,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ## Arquitetura
 
 - `storage.py`: contrato Markdown, validação, gravação e movimentação segura;
+- `conflicts.py`: snapshots privados, comparação por UUID e reconciliação explícita;
 - `backend.py`: ponte entre domínio e QML, trava e mensagens ao usuário;
 - `qml/Main.qml`: quadro Kanban e diálogos;
 - `packaging/`: instalação e remoção locais.
@@ -92,5 +102,5 @@ O utilitário `scripts/migrate_title_filenames.py` primeiro planeja todos os nom
 
 ## Limites atuais
 
-Não há anexos, exclusão de cartões nem resolução visual de conflitos. A prévia não abre links nem carrega imagens remotas. O futuro inicializador de projetos e a futura orquestração Codex/Claude Code serão componentes separados e não fazem parte deste aplicativo neste momento.
+Não há anexos nem exclusão de cartões pela interface. A prévia não abre links nem carrega imagens remotas. A limpeza das recuperações antigas é manual. O futuro inicializador de projetos e a futura orquestração Codex/Claude Code serão componentes separados e não fazem parte deste aplicativo neste momento.
 
