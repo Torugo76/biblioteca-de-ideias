@@ -478,6 +478,31 @@ class GitServiceSafetyTest(unittest.TestCase):
         self.assertEqual(options["env"]["GIT_CONFIG_GLOBAL"], os.devnull)
         self.assertEqual(options["env"]["GIT_CONFIG_COUNT"], "0")
 
+    @patch("biblioteca_ideias.git_sync.subprocess.run")
+    def test_network_command_pins_credential_and_ssh_helpers(self, run) -> None:
+        run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"", stderr=b"")
+        service = GitService(Path("/tmp"))
+        service.git = "/usr/bin/git"
+        approved = "ssh://git@github.com/Torugo76/biblioteca-de-ideias-cofre.git"
+        service._run_network(approved, ("ls-remote", approved), timeout=1)
+        command = run.call_args.args[0]
+        joined = "\0".join(command)
+        self.assertIn("credential.helper=", command)
+        self.assertIn("credential.helper=!/usr/bin/gh auth git-credential", command)
+        self.assertIn("core.sshCommand=/usr/bin/ssh", command)
+        self.assertIn(f"url.{approved}.insteadOf={approved}", joined)
+
+    def test_automatic_commit_uses_fixed_noreply_identity_without_global_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git(repo, "init", "--initial-branch=main")
+            (repo / "ideia.md").write_text("ideia\n", encoding="utf-8")
+            service = GitService(repo)
+            self.assertEqual(service.add_exact(("ideia.md",)).returncode, 0)
+            self.assertEqual(service.commit("ideia: salvar").returncode, 0)
+            identity = git(repo, "show", "-s", "--format=%an%x00%ae", "HEAD").split("\0")
+            self.assertEqual(identity, ["Biblioteca de Ideias", "Torugo76@users.noreply.github.com"])
+
     @patch("biblioteca_ideias.git_sync.subprocess.run", side_effect=subprocess.TimeoutExpired("git", 1))
     def test_timeout_is_bounded_and_sanitized(self, _run) -> None:
         service = GitService(Path("/tmp"), timeout=1)
@@ -766,6 +791,76 @@ class GitServiceSafetyTest(unittest.TestCase):
             self.assertEqual(effective["GIT_CONFIG_COUNT"], "0")
             self.assertNotIn("GIT_CONFIG_KEY_0", effective)
             self.assertNotIn("GIT_CONFIG_VALUE_0", effective)
+
+    def test_dangerous_environment_is_not_inherited_or_executed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            marker = root / "executed"
+            wrapper = root / "wrapper.sh"
+            wrapper.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n", encoding="utf-8")
+            wrapper.chmod(0o755)
+            git(root, "init", "--initial-branch=main", str(repo))
+            (repo / "arquivo.txt").write_text("conteudo\n", encoding="utf-8")
+            contaminated = {
+                "GIT_SSH_COMMAND": str(wrapper),
+                "GIT_SSH": str(wrapper),
+                "GIT_ASKPASS": str(wrapper),
+                "SSH_ASKPASS": str(wrapper),
+                "GIT_PROXY_COMMAND": str(wrapper),
+                "GIT_EXTERNAL_DIFF": str(wrapper),
+                "GIT_EDITOR": str(wrapper),
+                "GIT_SEQUENCE_EDITOR": str(wrapper),
+                "EDITOR": str(wrapper),
+                "VISUAL": str(wrapper),
+                "LD_PRELOAD": str(wrapper),
+                "LD_LIBRARY_PATH": str(root),
+                "PYTHONPATH": str(root),
+                "BASH_ENV": str(wrapper),
+                "ENV": str(wrapper),
+                "http_proxy": f"file://{wrapper}",
+                "https_proxy": f"file://{wrapper}",
+            }
+            with patch.dict(os.environ, contaminated):
+                service = GitService(repo)
+                result = service.run(("diff", "--", "arquivo.txt"))
+                environment = service._environment()
+            self.assertEqual(result.returncode, 0)
+            self.assertFalse(marker.exists())
+            for key in contaminated:
+                self.assertNotIn(key, environment)
+            self.assertIn("HOME", environment)
+
+    def test_local_executable_helpers_are_rejected_without_running(self) -> None:
+        unsafe_entries = (
+            ("core.sshCommand", "wrapper"),
+            ("core.gitProxy", "wrapper"),
+            ("credential.helper", "wrapper"),
+            ("filter.perigoso.clean", "wrapper"),
+            ("filter.perigoso.smudge", "wrapper"),
+            ("filter.perigoso.process", "wrapper"),
+            ("diff.external", "wrapper"),
+            ("diff.perigoso.command", "wrapper"),
+            ("http.https://github.com.proxy", "http://127.0.0.1:9"),
+            ("remote.origin.proxy", "http://127.0.0.1:9"),
+        )
+        for key, value in unsafe_entries:
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                approved = root / "approved.git"
+                repo = root / "repo"
+                marker = root / "executed"
+                wrapper = root / "wrapper"
+                wrapper.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n", encoding="utf-8")
+                wrapper.chmod(0o755)
+                git(root, "init", "--bare", "--initial-branch=main", str(approved))
+                git(root, "init", "--initial-branch=main", str(repo))
+                git(repo, "remote", "add", "origin", approved.as_uri())
+                git(repo, "config", key, str(wrapper) if value == "wrapper" else value)
+                service = GitService(repo, destination_validator=lambda: True)
+                result = service.fetch()
+                self.assertEqual(result.returncode, 125)
+                self.assertFalse(marker.exists())
 
     def test_concurrent_pushinstead_rewrite_is_blocked_by_config_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

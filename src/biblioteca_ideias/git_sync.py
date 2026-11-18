@@ -46,6 +46,41 @@ SENSITIVE_QUERY_KEYS = {
     "access_token", "token", "auth", "authorization", "password", "passwd",
     "secret", "client_secret", "api_key", "apikey",
 }
+SAFE_ENV_KEYS = (
+    "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS", "SSH_AUTH_SOCK",
+)
+
+
+def safe_subprocess_environment(*, for_gh: bool = False) -> dict[str, str]:
+    environment = {
+        key: os.environ[key]
+        for key in SAFE_ENV_KEYS
+        if key in os.environ and os.environ[key]
+    }
+    environment.update(
+        {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "LC_ALL": "C",
+            "LANG": "C",
+            "NO_COLOR": "1",
+        }
+    )
+    if for_gh:
+        environment["GH_PROMPT_DISABLED"] = "1"
+    else:
+        environment.update(
+            {
+                "GIT_TERMINAL_PROMPT": "0",
+                "GCM_INTERACTIVE": "Never",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_COUNT": "0",
+                "GIT_ATTR_NOSYSTEM": "1",
+            }
+        )
+    return environment
 
 
 @dataclass(frozen=True)
@@ -103,30 +138,7 @@ class GitService:
         self._validated_destination: ValidatedDestination | None = None
 
     def _environment(self) -> dict[str, str]:
-        environment = os.environ.copy()
-        for key in tuple(environment):
-            if (
-                key in {
-                    "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_DIR", "GIT_WORK_TREE",
-                    "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
-                    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-                }
-                or key.startswith("GIT_CONFIG_KEY_")
-                or key.startswith("GIT_CONFIG_VALUE_")
-            ):
-                environment.pop(key, None)
-        environment.update(
-            {
-                "GIT_TERMINAL_PROMPT": "0",
-                "GCM_INTERACTIVE": "Never",
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_CONFIG_SYSTEM": os.devnull,
-                "GIT_CONFIG_GLOBAL": os.devnull,
-                "GIT_CONFIG_COUNT": "0",
-                "LC_ALL": "C",
-            }
-        )
-        return environment
+        return safe_subprocess_environment()
 
     def run(self, args: Iterable[str], timeout: float | None = None) -> CommandResult:
         if self.git is None:
@@ -134,6 +146,10 @@ class GitService:
         command = [
             self.git,
             "-c", "core.hooksPath=/dev/null",
+            "-c", "core.fsmonitor=false",
+            "-c", "core.attributesFile=/dev/null",
+            "-c", "core.gitProxy=",
+            "-c", "commit.gpgSign=false",
             "-c", "credential.interactive=never",
             *list(args),
         ]
@@ -207,26 +223,29 @@ class GitService:
         return self.run(("merge-base", "--is-ancestor", older, newer)).returncode == 0
 
     def fast_forward(self) -> CommandResult:
-        status, records = self.status_records()
-        if status.returncode != 0 or self.has_any_changes(records):
-            return CommandResult(3, "", "alterações concorrentes preservadas")
-        if self.has_lock_contention():
-            return CommandResult(4, "", "repositório ocupado por outra operação Git")
-        local = self.ref("HEAD")
-        remote = self.ref("origin/main")
-        if not local or not remote or not self.is_ancestor(local, remote):
-            return CommandResult(2, "", "fast-forward recusado")
-        advanced = self.run(
-            ("-c", "merge.autoStash=false", "merge", "--ff-only", "--no-edit", "origin/main")
-        )
-        final_status, final_records = self.status_records()
-        if advanced.returncode == 0 and (
-            final_status.returncode != 0 or self.has_any_changes(final_records)
-        ):
-            return CommandResult(3, "", "alterações concorrentes preservadas")
-        return advanced
+        with self._network_config_guard() as guard_error:
+            if guard_error:
+                return CommandResult(4, "", guard_error)
+            status, records = self.status_records()
+            if status.returncode != 0 or self.has_any_changes(records):
+                return CommandResult(3, "", "alterações concorrentes preservadas")
+            if self.has_lock_contention(ignore_config_locks=True):
+                return CommandResult(4, "", "repositório ocupado por outra operação Git")
+            local = self.ref("HEAD")
+            remote = self.ref("origin/main")
+            if not local or not remote or not self.is_ancestor(local, remote):
+                return CommandResult(2, "", "fast-forward recusado")
+            advanced = self.run(
+                ("-c", "merge.autoStash=false", "merge", "--ff-only", "--no-edit", "origin/main")
+            )
+            final_status, final_records = self.status_records()
+            if advanced.returncode == 0 and (
+                final_status.returncode != 0 or self.has_any_changes(final_records)
+            ):
+                return CommandResult(3, "", "alterações concorrentes preservadas")
+            return advanced
 
-    def has_lock_contention(self) -> bool:
+    def has_lock_contention(self, *, ignore_config_locks: bool = False) -> bool:
         for lock_name in ("index.lock", "refs/heads/main.lock", "packed-refs.lock"):
             result = self.run(("rev-parse", "--git-path", lock_name))
             if result.returncode != 0:
@@ -274,7 +293,14 @@ class GitService:
         identity_options = (
             "-c", f"url.{approved_url}.insteadOf={approved_url}",
             "-c", f"url.{approved_url}.pushInsteadOf={approved_url}",
+            "-c", "credential.helper=",
         )
+        gh = shutil.which("gh", path=self._environment()["PATH"])
+        if gh:
+            identity_options += ("-c", f"credential.helper=!{gh} auth git-credential")
+        ssh = shutil.which("ssh", path=self._environment()["PATH"])
+        if ssh:
+            identity_options += ("-c", f"core.sshCommand={ssh}")
         return self.run((*identity_options, *tuple(args)), timeout=timeout)
 
     @contextmanager
@@ -315,6 +341,21 @@ class GitService:
                         or (normalized.startswith("includeif.") and normalized.endswith(".path"))
                         or (normalized.startswith("url.") and normalized.endswith(".insteadof"))
                         or (normalized.startswith("url.") and normalized.endswith(".pushinsteadof"))
+                        or normalized in {
+                            "core.sshcommand", "core.gitproxy", "credential.helper",
+                            "diff.external", "core.fsmonitor",
+                        }
+                        or (normalized.startswith("credential.") and normalized.endswith(".helper"))
+                        or (
+                            normalized.startswith("filter.")
+                            and normalized.endswith((".clean", ".smudge", ".process"))
+                        )
+                        or (normalized.startswith("diff.") and normalized.endswith(".command"))
+                        or (
+                            normalized.startswith("remote.")
+                            and normalized.endswith((".proxy", ".uploadpack", ".receivepack"))
+                        )
+                        or (normalized.startswith("http.") and normalized.endswith(".proxy"))
                     ):
                         unsafe = True
                         break
@@ -384,14 +425,23 @@ class GitService:
         )
         if not effective:
             return CommandResult(0, "", "")
-        return self.run(("add", "-A", "--", *effective))
+        with self._network_config_guard() as guard_error:
+            if guard_error:
+                return CommandResult(125, "", guard_error)
+            return self.run(("add", "-A", "--", *effective))
 
     def staged_paths(self) -> tuple[CommandResult, set[str]]:
         result = self.run(("diff", "--cached", "--name-only", "-z"))
         return result, {path for path in result.stdout.split("\0") if path}
 
     def commit(self, message: str) -> CommandResult:
-        return self.run(("commit", "--no-verify", "-m", message))
+        return self.run(
+            (
+                "-c", "user.name=Biblioteca de Ideias",
+                "-c", "user.email=Torugo76@users.noreply.github.com",
+                "commit", "--no-verify", "-m", message,
+            )
+        )
 
     def unstage_exact(self, relative_paths: Iterable[str]) -> CommandResult:
         paths = tuple(dict.fromkeys(relative_paths))
@@ -424,11 +474,10 @@ def classify_failure(result: CommandResult) -> str:
 
 
 def detect_github_cli(timeout: float = 5.0) -> tuple[bool, str | None]:
-    gh = shutil.which("gh")
+    environment = safe_subprocess_environment(for_gh=True)
+    gh = shutil.which("gh", path=environment["PATH"])
     if gh is None:
         return False, None
-    environment = os.environ.copy()
-    environment.update({"GH_PROMPT_DISABLED": "1", "NO_COLOR": "1", "LC_ALL": "C"})
     try:
         result = subprocess.run(
             [gh, "auth", "status", "--hostname", "github.com"],
@@ -455,11 +504,10 @@ def detect_github_cli(timeout: float = 5.0) -> tuple[bool, str | None]:
 
 
 def validate_github_repository_metadata(timeout: float = 8.0) -> bool:
-    gh = shutil.which("gh")
+    environment = safe_subprocess_environment(for_gh=True)
+    gh = shutil.which("gh", path=environment["PATH"])
     if gh is None:
         return False
-    environment = os.environ.copy()
-    environment.update({"GH_PROMPT_DISABLED": "1", "NO_COLOR": "1", "LC_ALL": "C"})
     try:
         result = subprocess.run(
             [gh, "repo", "view", EXPECTED_REPOSITORY, "--json", "nameWithOwner,visibility"],
