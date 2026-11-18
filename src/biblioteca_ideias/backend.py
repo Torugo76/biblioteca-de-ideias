@@ -233,6 +233,7 @@ class Backend(QObject):
     @Slot()
     def connectGithub(self) -> None:
         self._state_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._state_path.chmod(0o700)
         self._disabled_marker.unlink(missing_ok=True)
         self._integration_enabled = True
         self.githubEnabledChanged.emit()
@@ -252,6 +253,7 @@ class Backend(QObject):
     @Slot()
     def disconnectGithub(self) -> None:
         self._state_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._state_path.chmod(0o700)
         self._disabled_marker.write_text("disabled\n", encoding="utf-8")
         self._disabled_marker.chmod(0o600)
         self._integration_enabled = False

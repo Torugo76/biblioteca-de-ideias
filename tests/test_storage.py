@@ -50,6 +50,7 @@ class MarkdownStoreTest(unittest.TestCase):
     def test_create_uses_title_filename_and_global_casefold_collision(self) -> None:
         first = self.store.create("Café Único", "## Resumo\n\nPrimeira\n")
         self.assertEqual(first.path.name, "Café Único.md")
+        self.assertEqual(first.path.stat().st_mode & 0o777, 0o600)
         with self.assertRaises(CollisionError):
             self.store.create("CAFÉ ÚNICO", "Outra")
 
@@ -113,6 +114,19 @@ class MarkdownStoreTest(unittest.TestCase):
         self.assertEqual(saved.path.name, "Novo título 🚀.md")
         self.assertFalse(created.path.exists())
         self.assertIn("## Extra\n\nPreservar", saved.body)
+        self.assertEqual(saved.path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(saved.path.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_opening_store_removes_group_and_other_permissions(self) -> None:
+        idea = self.store.create("Privada", "Corpo")
+        self.vault.chmod(0o755)
+        idea.path.parent.chmod(0o775)
+        idea.path.chmod(0o644)
+        reopened = MarkdownStore(self.vault, self.state)
+        loaded = reopened.list_ideas()[0]
+        self.assertEqual(self.vault.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(loaded.path.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(loaded.path.stat().st_mode & 0o777, 0o600)
 
     def test_external_change_is_not_overwritten_or_moved(self) -> None:
         idea = self.store.create("Original", "Resumo")

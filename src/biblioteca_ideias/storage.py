@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import unicodedata
 import uuid
 from dataclasses import dataclass
@@ -60,6 +61,45 @@ class ExternalChangeError(StorageError):
 
 class CollisionError(StorageError):
     pass
+
+
+def enforce_private_tree(root: Path) -> None:
+    if root.is_symlink() or not root.is_dir():
+        raise StorageError("O cofre não é uma pasta privada válida.")
+    pending = [root]
+    directories: list[Path] = []
+    files: list[tuple[Path, int]] = []
+    while pending:
+        directory = pending.pop()
+        directories.append(directory)
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            raise StorageError("Não foi possível verificar as permissões do cofre.") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                mode = entry.stat(follow_symlinks=False).st_mode
+            except OSError as exc:
+                raise StorageError("Não foi possível verificar as permissões do cofre.") from exc
+            if stat.S_ISLNK(mode):
+                raise StorageError("O cofre contém link simbólico inseguro.")
+            if stat.S_ISDIR(mode):
+                pending.append(path)
+            elif stat.S_ISREG(mode):
+                files.append((path, mode))
+            else:
+                raise StorageError("O cofre contém arquivo especial inseguro.")
+    try:
+        for directory in directories:
+            directory.chmod(0o700)
+        objects_root = root / ".git" / "objects"
+        for path, mode in files:
+            in_objects = objects_root in path.parents
+            private_mode = 0o400 if in_objects and not (mode & stat.S_IWUSR) else 0o600
+            path.chmod(private_mode)
+    except OSError as exc:
+        raise StorageError("Não foi possível aplicar permissões privadas ao cofre.") from exc
 
 
 @dataclass(frozen=True)
@@ -134,6 +174,7 @@ class MarkdownStore:
         default_state = self.vault.parent / ".biblioteca-de-ideias-state"
         self.state_dir = (state_dir or default_state).expanduser().resolve(strict=False)
         self._prepare_vault()
+        enforce_private_tree(self.vault)
         self._prepare_state()
         self._recover_interrupted_migration()
         self._assert_no_orphan_migration_files()
@@ -145,14 +186,17 @@ class MarkdownStore:
         if self.vault.exists() and self.vault.is_symlink():
             raise StorageError("O cofre não pode ser um link simbólico.")
         self.vault.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.vault, 0o700)
         for key, _ in COLUMNS:
             column = self.vault / key
             if column.exists() and (column.is_symlink() or not column.is_dir()):
                 raise StorageError(f"A coluna {key} não é uma pasta segura.")
             column.mkdir(exist_ok=True)
+            os.chmod(column, 0o700)
             keep = column / ".gitkeep"
             if not keep.exists():
                 keep.touch()
+            os.chmod(keep, 0o600)
 
     def _prepare_state(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -530,3 +574,7 @@ class MarkdownStore:
             raise StorageError(f"Não foi possível gravar {path.name} por completo.")
         if not save.commit():
             raise StorageError(f"Não foi possível concluir a gravação segura de {path.name}.")
+        try:
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            raise StorageError(f"Não foi possível proteger as permissões de {path.name}.") from exc

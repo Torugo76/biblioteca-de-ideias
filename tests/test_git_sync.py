@@ -388,6 +388,7 @@ class GitIntegrationTest(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(command, ["/usr/bin/gh", "auth", "status", "--hostname", "github.com"])
         self.assertNotIn("token", command)
+        self.assertEqual(run.call_args.kwargs["umask"], 0o077)
 
 
 class SlowService:
@@ -477,6 +478,7 @@ class GitServiceSafetyTest(unittest.TestCase):
         self.assertEqual(options["env"]["GIT_CONFIG_NOSYSTEM"], "1")
         self.assertEqual(options["env"]["GIT_CONFIG_GLOBAL"], os.devnull)
         self.assertEqual(options["env"]["GIT_CONFIG_COUNT"], "0")
+        self.assertEqual(options["umask"], 0o077)
 
     def test_inherited_path_cannot_replace_git_gh_or_ssh(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

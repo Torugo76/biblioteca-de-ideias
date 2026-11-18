@@ -19,6 +19,7 @@ from biblioteca_ideias.bootstrap import (
     validate_existing_vault,
 )
 from biblioteca_ideias.storage import MarkdownStore
+from biblioteca_ideias.git_sync import GitService
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -81,7 +82,34 @@ class BootstrapTest(unittest.TestCase):
                 self.assertEqual(path.stat().st_mode & 0o777, 0o700, path)
             elif path.is_file():
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600, path)
-        self.assertEqual(git(destination, "status", "--porcelain"), "")
+        service = GitService(destination, destination_validator=lambda: True)
+        status, records = service.status_records()
+        self.assertEqual(status.returncode, 0)
+        self.assertFalse(records)
+
+        (self.seed / "remota.md").write_text("remota\n", encoding="utf-8")
+        git(self.seed, "add", "--", "remota.md")
+        git(self.seed, "commit", "-m", "remota")
+        git(self.seed, "push", "origin", "main")
+        self.assertEqual(service.fetch().returncode, 0)
+        self.assertEqual(service.fast_forward().returncode, 0)
+
+        local_store = MarkdownStore(destination, state_dir=self.root / "local-state")
+        local_idea = local_store.create("Local", "Corpo")
+        relative = local_idea.path.relative_to(destination).as_posix()
+        self.assertEqual(service.add_exact((relative,)).returncode, 0)
+        self.assertEqual(service.commit("ideia: local").returncode, 0)
+        self.assertEqual(service.push().returncode, 0)
+        for path in (destination, *destination.rglob("*")):
+            mode = path.stat().st_mode & 0o777
+            if path.is_dir():
+                self.assertEqual(mode & 0o077, 0, path)
+            elif path.is_file():
+                self.assertEqual(mode & 0o077, 0, path)
+                if path.suffix == ".md" or path.name in {"config", "index", "HEAD"}:
+                    self.assertEqual(mode, 0o600, path)
+                if destination / ".git" / "objects" in path.parents:
+                    self.assertIn(mode, (0o400, 0o600), path)
         self.assertFalse(list(destination.parent.glob(".cofre-bootstrap-*")))
 
     def test_existing_nonempty_destination_is_preserved(self) -> None:
@@ -259,6 +287,22 @@ class BootstrapTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(BootstrapError, "não está instalado"):
                     coordinator._login()
+        finally:
+            coordinator.close()
+
+    def test_login_process_uses_private_umask(self) -> None:
+        vault = self.root / "existente-umask"
+        vault.mkdir()
+        coordinator = BootstrapCoordinator(vault)
+        try:
+            with (
+                patch("biblioteca_ideias.bootstrap.detect_github_cli", return_value=(False, None)),
+                patch("biblioteca_ideias.bootstrap.resolve_system_executable", return_value="/usr/bin/gh"),
+                patch("biblioteca_ideias.bootstrap.subprocess.Popen", side_effect=OSError) as popen,
+            ):
+                with self.assertRaises(BootstrapError):
+                    coordinator._login()
+            self.assertEqual(popen.call_args.kwargs["umask"], 0o077)
         finally:
             coordinator.close()
 

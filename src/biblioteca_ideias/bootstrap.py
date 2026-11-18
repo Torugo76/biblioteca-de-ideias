@@ -206,6 +206,7 @@ def clone_existing_vault(vault: Path) -> Path:
             timeout=90,
             check=False,
             shell=False,
+            umask=0o077,
         )
         if completed.returncode != 0:
             raise BootstrapError("Não foi possível baixar o cofre privado. Seus dados locais não foram alterados.")
@@ -303,6 +304,7 @@ class BootstrapCoordinator(QObject):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 shell=False,
+                umask=0o077,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise BootstrapError("Não foi possível iniciar o login oficial do GitHub.") from exc

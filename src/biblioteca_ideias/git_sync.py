@@ -182,6 +182,7 @@ class GitService:
                 timeout=timeout or self.timeout,
                 check=False,
                 shell=False,
+                umask=0o077,
             )
         except subprocess.TimeoutExpired:
             return CommandResult(124, "", "tempo limite excedido")
@@ -508,6 +509,7 @@ def detect_github_cli(timeout: float = 5.0) -> tuple[bool, str | None]:
             timeout=timeout,
             check=False,
             shell=False,
+            umask=0o077,
         )
     except subprocess.TimeoutExpired:
         return False, None
@@ -538,6 +540,7 @@ def validate_github_repository_metadata(timeout: float = 8.0) -> bool:
             timeout=timeout,
             check=False,
             shell=False,
+            umask=0o077,
         )
     except (OSError, subprocess.SubprocessError):
         return False
