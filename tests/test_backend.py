@@ -13,11 +13,16 @@ class FakeCoordinator(QObject):
     authChanged = Signal(bool, str)
     repositoryUpdated = Signal()
 
+    def __init__(self):
+        super().__init__()
+        self.save_requests = []
+        self.sync_requests = 0
+
     def request_save(self, paths, message):
-        pass
+        self.save_requests.append((tuple(paths), message))
 
     def request_sync(self):
-        pass
+        self.sync_requests += 1
 
     def close(self):
         pass
@@ -119,6 +124,22 @@ class BackendTest(unittest.TestCase):
             self.assertEqual(backend.syncStatus, STATE_ERROR)
             self.assertIn("UUID duplicado", backend.notice)
         finally:
+            backend._lock.unlock()
+
+    def test_disconnect_is_local_and_prevents_automatic_sync(self) -> None:
+        coordinator = FakeCoordinator()
+        backend = Backend(self.root / "cofre-desconectado", sync_coordinator=coordinator)
+        try:
+            backend.disconnectGithub()
+            self.assertFalse(backend.githubEnabled)
+            self.assertTrue(backend._disabled_marker.exists())
+            self.assertEqual(backend._disabled_marker.stat().st_mode & 0o777, 0o600)
+            self.assertIn("não foi alterado", backend.notice.casefold())
+            backend.syncNow()
+            self.assertEqual(coordinator.sync_requests, 0)
+            self.assertIn("desativada", backend.notice.casefold())
+        finally:
+            backend.close()
             backend._lock.unlock()
 
 

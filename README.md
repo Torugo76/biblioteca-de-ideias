@@ -12,6 +12,7 @@ Aplicativo desktop para Fedora KDE que organiza ideias em um quadro Kanban e gra
 - preservação do corpo integral e de seções personalizadas;
 - tela de configurações com caminho real, abertura segura e quantidade de ideias;
 - sincronização Git assíncrona ao abrir, manualmente e após cada salvamento;
+- instalação em outro computador por login oficial no navegador e clone validado do cofre privado existente;
 - estados claros para offline, autenticação, envio pendente e divergência;
 - gravação atômica com `QSaveFile`;
 - recusa de sobrescrita quando outro programa alterou o Markdown;
@@ -64,6 +65,9 @@ O aplicativo usa uma fila FIFO única em uma thread dedicada; a interface não e
 - falta de rede mantém o commit local como envio pendente;
 - falhas de Git não desfazem o Markdown salvo localmente;
 - falha de commit remove do índice somente os caminhos adicionados pela operação, sem tocar no worktree ou em staged externo;
+- numa instalação nova, o app clona em diretório temporário privado, valida branch, remoto, privacidade, estrutura e Markdown e só então move o cofre atomicamente ao destino XDG;
+- uma pasta de destino já existente nunca é substituída; login cancelado, conta errada ou repositório inacessível preservam o conteúdo local;
+- “Desconectar do aplicativo” desativa somente a integração local e não executa `gh auth logout`;
 - o GitHub CLI é consultado apenas com `gh auth status`; tokens e arquivos de credenciais não são lidos.
 
 O botão **Sincronizar** executa a atualização manual. A barra informa: Sincronizado, Sincronizando, Alterações locais, Envio pendente, Offline, Login necessário, Conflito precisa de atenção ou Erro dados locais salvos.

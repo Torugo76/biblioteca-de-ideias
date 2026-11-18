@@ -11,6 +11,7 @@ from PySide6.QtGui import QDesktopServices, QGuiApplication
 
 from .storage import COLUMNS, INITIAL_BODY, MarkdownStore, StorageError
 from .git_sync import STATE_ERROR, STATE_LOCAL, SyncCoordinator
+from .bootstrap import BootstrapCoordinator, BootstrapError, validate_existing_vault
 
 
 APP_ID = "br.com.torugo.bibliotecadeideias"
@@ -37,6 +38,8 @@ class Backend(QObject):
     noticeChanged = Signal()
     syncStateChanged = Signal()
     authStatusChanged = Signal()
+    readyChanged = Signal()
+    githubEnabledChanged = Signal()
 
     def __init__(
         self,
@@ -45,25 +48,58 @@ class Backend(QObject):
         sync_coordinator: SyncCoordinator | None = None,
     ):
         super().__init__(parent)
-        self._notice = "Pronto. Seus dados estão somente neste computador."
+        self._notice = "Preparando a Biblioteca de Ideias…"
         vault_path = vault or default_vault_path()
+        self._vault_path = vault_path
         vault_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = QLockFile(str(vault_path.with_suffix(".lock")))
         self._lock.setStaleLockTime(30_000)
         if not self._lock.tryLock(0):
             raise StorageError("A Biblioteca de Ideias já está aberta para este cofre.")
-        state_path = default_state_path() if vault is None else vault_path.parent / ".state-test"
-        self._store = MarkdownStore(vault_path, state_dir=state_path)
+        self._state_path = default_state_path() if vault is None else vault_path.parent / ".state-test"
+        self._disabled_marker = self._state_path / "github-disabled"
+        self._integration_enabled = not self._disabled_marker.exists()
+        self._store: MarkdownStore | None = None
         self._ideas: list[dict[str, str]] = []
         self._sync_state = STATE_LOCAL
         self._auth_status = "GitHub CLI não autenticado"
-        self._sync = sync_coordinator or SyncCoordinator(vault_path, auto_sync=vault is None)
+        self._sync: SyncCoordinator | None = None
+        self._bootstrap: BootstrapCoordinator | None = None
+        if vault is not None:
+            self._initialize_store(sync_coordinator, auto_sync=False)
+        elif vault_path.exists():
+            try:
+                validate_existing_vault(vault_path)
+            except BootstrapError as exc:
+                self._notice = str(exc)
+            else:
+                self._initialize_store(None, auto_sync=self._integration_enabled)
+        else:
+            self._bootstrap = BootstrapCoordinator(vault_path, self)
+            self._bootstrap.stateChanged.connect(self._on_bootstrap_state)
+            self._bootstrap.progressChanged.connect(self._on_bootstrap_progress)
+            self._bootstrap.authChanged.connect(self._on_bootstrap_auth)
+            self._bootstrap.ready.connect(self._on_bootstrap_ready, Qt.ConnectionType.QueuedConnection)
+            if self._integration_enabled:
+                self._bootstrap.inspect_or_bootstrap()
+            else:
+                self._notice = "Integração GitHub desativada neste aplicativo."
+
+    def _initialize_store(
+        self,
+        sync_coordinator: SyncCoordinator | None,
+        *,
+        auto_sync: bool,
+    ) -> None:
+        self._store = MarkdownStore(self._vault_path, state_dir=self._state_path)
+        self._sync = sync_coordinator or SyncCoordinator(self._vault_path, auto_sync=auto_sync)
         self._sync.stateChanged.connect(self._on_sync_state)
         self._sync.authChanged.connect(self._on_auth_status)
         self._sync.repositoryUpdated.connect(
             self._reload_after_fast_forward, Qt.ConnectionType.QueuedConnection
         )
         self.reload()
+        self.readyChanged.emit()
 
     @Property("QVariantList", notify=ideasChanged)
     def ideas(self) -> list[dict[str, str]]:
@@ -79,7 +115,15 @@ class Backend(QObject):
 
     @Property(str, constant=True)
     def vaultPath(self) -> str:
-        return str(self._store.vault)
+        return str(self._vault_path)
+
+    @Property(bool, notify=readyChanged)
+    def ready(self) -> bool:
+        return self._store is not None
+
+    @Property(bool, notify=githubEnabledChanged)
+    def githubEnabled(self) -> bool:
+        return self._integration_enabled
 
     @Property(int, notify=ideasChanged)
     def ideaCount(self) -> int:
@@ -129,6 +173,9 @@ class Backend(QObject):
 
     @Slot()
     def reload(self) -> None:
+        if self._store is None:
+            self._set_notice("Conecte o GitHub para instalar o cofre privado existente.")
+            return
         try:
             self._ideas = [idea.as_dict() for idea in self._store.list_ideas()]
             self.ideasChanged.emit()
@@ -138,12 +185,16 @@ class Backend(QObject):
 
     @Slot(str, str, result=bool)
     def createIdea(self, title: str, body: str) -> bool:
+        if self._store is None:
+            self._set_notice("O cofre ainda não está disponível.")
+            return False
         try:
             created = self._store.create(title, body)
             self.reload()
             self._set_notice("Ideia criada em Entrada.")
             relative = created.path.relative_to(self._store.vault).as_posix()
-            self._sync.request_save((relative,), f"ideia: criar {created.title}")
+            if self._sync is not None and self._integration_enabled:
+                self._sync.request_save((relative,), f"ideia: criar {created.title}")
             return True
         except StorageError as exc:
             self._set_notice(str(exc))
@@ -151,6 +202,9 @@ class Backend(QObject):
 
     @Slot(str, str, str, str, str, result=bool)
     def saveIdea(self, idea_id: str, title: str, body: str, status: str, expected_hash: str) -> bool:
+        if self._store is None:
+            self._set_notice("O cofre ainda não está disponível.")
+            return False
         try:
             current = {idea.idea_id: idea for idea in self._store.list_ideas()}[idea_id]
             saved = self._store.save_idea(idea_id, title, body, status, expected_hash)
@@ -160,7 +214,8 @@ class Backend(QObject):
                 current.path.relative_to(self._store.vault).as_posix(),
                 saved.path.relative_to(self._store.vault).as_posix(),
             )
-            self._sync.request_save(paths, f"ideia: atualizar {saved.title}")
+            if self._sync is not None and self._integration_enabled:
+                self._sync.request_save(paths, f"ideia: atualizar {saved.title}")
             return True
         except (KeyError, StorageError) as exc:
             self._set_notice(str(exc))
@@ -168,10 +223,72 @@ class Backend(QObject):
 
     @Slot()
     def syncNow(self) -> None:
-        self._sync.request_sync()
+        if not self._integration_enabled:
+            self._set_notice("A integração GitHub está desativada neste aplicativo.")
+        elif self._sync is not None:
+            self._sync.request_sync()
+        else:
+            self._set_notice("Conecte sua conta do GitHub para instalar o cofre.")
+
+    @Slot()
+    def connectGithub(self) -> None:
+        self._state_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._disabled_marker.unlink(missing_ok=True)
+        self._integration_enabled = True
+        self.githubEnabledChanged.emit()
+        if self._bootstrap is None:
+            self._bootstrap = BootstrapCoordinator(self._vault_path, self)
+            self._bootstrap.stateChanged.connect(self._on_bootstrap_state)
+            self._bootstrap.progressChanged.connect(self._on_bootstrap_progress)
+            self._bootstrap.authChanged.connect(self._on_bootstrap_auth)
+            self._bootstrap.ready.connect(self._on_bootstrap_ready, Qt.ConnectionType.QueuedConnection)
+        self._bootstrap.connect_account()
+
+    @Slot()
+    def cancelGithubLogin(self) -> None:
+        if self._bootstrap is not None:
+            self._bootstrap.cancel_login()
+
+    @Slot()
+    def disconnectGithub(self) -> None:
+        self._state_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._disabled_marker.write_text("disabled\n", encoding="utf-8")
+        self._disabled_marker.chmod(0o600)
+        self._integration_enabled = False
+        self._auth_status = "Integração GitHub desativada neste aplicativo"
+        self.githubEnabledChanged.emit()
+        self.authStatusChanged.emit()
+        self._set_notice("Integração desativada localmente. O login global não foi alterado.")
+
+    @Slot(str)
+    def _on_bootstrap_state(self, message: str) -> None:
+        self._set_notice(message)
+
+    @Slot(str)
+    def _on_bootstrap_progress(self, message: str) -> None:
+        self._set_notice(message)
+
+    @Slot(bool, str)
+    def _on_bootstrap_auth(self, authenticated: bool, username: str) -> None:
+        self._on_auth_status(authenticated, username)
+        if authenticated and self._sync is not None and self._integration_enabled:
+            self._sync.request_sync()
+
+    @Slot(str)
+    def _on_bootstrap_ready(self, path: str) -> None:
+        if Path(path) != self._vault_path or self._store is not None:
+            return
+        try:
+            self._initialize_store(None, auto_sync=self._integration_enabled)
+            self._set_notice("Cofre privado pronto para uso.")
+        except StorageError as exc:
+            self._set_notice(str(exc))
 
     def close(self) -> None:
-        self._sync.close()
+        if self._sync is not None:
+            self._sync.close()
+        if self._bootstrap is not None:
+            self._bootstrap.close()
 
     @Slot(str, result=str)
     def safePreviewMarkdown(self, markdown: str) -> str:

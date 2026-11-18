@@ -15,7 +15,7 @@ from .storage import StorageError
 def main() -> int:
     QCoreApplication.setOrganizationName("Torugo")
     QCoreApplication.setApplicationName("Biblioteca de Ideias")
-    QCoreApplication.setApplicationVersion("0.4.0")
+    QCoreApplication.setApplicationVersion("0.5.0")
     QGuiApplication.setDesktopFileName(APP_ID)
 
     app = QGuiApplication(sys.argv)

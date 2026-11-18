@@ -71,12 +71,12 @@ Kirigami.ApplicationWindow {
             }
             Controls.Button {
                 text: "Sincronizar"
-                enabled: backend.syncStatus !== "Sincronizando"
+                enabled: backend.ready && backend.githubEnabled && backend.syncStatus !== "Sincronizando"
                 onClicked: backend.syncNow()
             }
             Controls.Button { text: "Configurações"; onClicked: settingsDialog.open() }
-            Controls.Button { text: "Recarregar"; onClicked: backend.reload() }
-            Controls.Button { text: "Nova ideia"; highlighted: true; onClicked: root.openEditor(null) }
+            Controls.Button { text: "Recarregar"; enabled: backend.ready; onClicked: backend.reload() }
+            Controls.Button { text: "Nova ideia"; enabled: backend.ready; highlighted: true; onClicked: root.openEditor(null) }
         }
     }
 
@@ -332,9 +332,27 @@ Kirigami.ApplicationWindow {
             Controls.Label { text: "Quantidade de ideias: " + backend.ideaCount }
             Controls.Label { text: backend.syncStatus; color: Kirigami.Theme.disabledTextColor }
             Controls.Label { text: backend.authStatus; color: Kirigami.Theme.disabledTextColor }
+            Controls.Label { text: "GitHub"; font.bold: true; font.pixelSize: 18 }
             Controls.Label {
                 Layout.fillWidth: true
-                text: "A localização do cofre é fixa neste incremento."
+                text: backend.githubEnabled
+                      ? "A integração usa o login oficial do GitHub CLI."
+                      : "Integração desativada somente neste aplicativo."
+                wrapMode: Text.WordWrap
+                color: Kirigami.Theme.disabledTextColor
+            }
+            RowLayout {
+                Controls.Button { text: "Conectar conta"; onClicked: backend.connectGithub() }
+                Controls.Button { text: "Cancelar login"; onClicked: backend.cancelGithubLogin() }
+                Controls.Button {
+                    text: "Desconectar do aplicativo"
+                    enabled: backend.githubEnabled
+                    onClicked: backend.disconnectGithub()
+                }
+            }
+            Controls.Label {
+                Layout.fillWidth: true
+                text: "Desconectar não encerra o login global do GitHub CLI nem apaga o cofre local."
                 wrapMode: Text.WordWrap
                 color: Kirigami.Theme.disabledTextColor
             }
