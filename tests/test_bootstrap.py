@@ -15,6 +15,7 @@ from biblioteca_ideias.bootstrap import (
     _renameat2_noreplace,
     clone_existing_vault,
     harden_vault_tree,
+    terminate_and_reap,
     validate_existing_vault,
 )
 from biblioteca_ideias.storage import MarkdownStore
@@ -267,7 +268,12 @@ class BootstrapTest(unittest.TestCase):
         marker = vault / "preservar.txt"
         marker.write_text("preservado", encoding="utf-8")
         fake_gh = self.root / "gh-lento"
-        fake_gh.write_text("#!/bin/sh\nprintf 'Código WXYZ-9876\\n'\nsleep 10\n", encoding="utf-8")
+        pid_file = self.root / "login.pid"
+        fake_gh.write_text(
+            f"#!/bin/sh\necho $$ > '{pid_file}'\ntrap '' TERM\n"
+            "printf 'Código WXYZ-9876\\n'\nexec sleep 10\n",
+            encoding="utf-8",
+        )
         fake_gh.chmod(0o755)
         coordinator = BootstrapCoordinator(vault)
         states: list[str] = []
@@ -288,6 +294,84 @@ class BootstrapTest(unittest.TestCase):
                 self.application.processEvents()
             self.assertTrue(any("cancelado" in state.casefold() for state in states))
             self.assertEqual(marker.read_text(encoding="utf-8"), "preservado")
+            pid = int(pid_file.read_text(encoding="utf-8"))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+        finally:
+            coordinator.close()
+
+    def test_terminate_and_reap_kills_sigterm_resistant_process(self) -> None:
+        class ResistantProcess:
+            def __init__(self):
+                self.terminated = 0
+                self.killed = 0
+                self.waited = 0
+                self.dead = False
+
+            def poll(self):
+                return -9 if self.dead else None
+
+            def terminate(self):
+                self.terminated += 1
+
+            def wait(self, timeout=None):
+                self.waited += 1
+                if not self.dead:
+                    raise subprocess.TimeoutExpired("gh", timeout)
+                return -9
+
+            def kill(self):
+                self.killed += 1
+                self.dead = True
+
+        process = ResistantProcess()
+        terminate_and_reap(process, grace_seconds=0.01)  # type: ignore[arg-type]
+        self.assertEqual(process.terminated, 1)
+        self.assertEqual(process.killed, 1)
+        self.assertEqual(process.waited, 2)
+        self.assertTrue(process.dead)
+
+    def test_timeout_reaps_process_and_worker_accepts_next_login(self) -> None:
+        vault = self.root / "existente-timeout"
+        vault.mkdir()
+        pid_file = self.root / "timeout.pid"
+        fake_gh = self.root / "gh-timeout"
+        fake_gh.write_text(
+            f"#!/bin/sh\necho $$ > '{pid_file}'\ntrap '' TERM\n"
+            "printf 'Aguardando navegador\\n'\nexec sleep 10\n",
+            encoding="utf-8",
+        )
+        fake_gh.chmod(0o755)
+        coordinator = BootstrapCoordinator(vault)
+        states: list[str] = []
+        coordinator.stateChanged.connect(states.append)
+        clock_calls = 0
+
+        def fake_clock():
+            nonlocal clock_calls
+            clock_calls += 1
+            return 0 if clock_calls <= 2 else 181
+
+        try:
+            with (
+                patch(
+                    "biblioteca_ideias.bootstrap.detect_github_cli",
+                    side_effect=[(False, None), (True, "Torugo76")],
+                ),
+                patch("biblioteca_ideias.bootstrap.resolve_system_executable", return_value=str(fake_gh)),
+                patch("biblioteca_ideias.bootstrap.time.monotonic", side_effect=fake_clock),
+            ):
+                coordinator.connect_account()
+                coordinator._queue.join()
+                coordinator.connect_account()
+                coordinator._queue.join()
+            self.application.processEvents()
+            self.assertTrue(coordinator._worker.is_alive())
+            self.assertTrue(any("tempo limite" in state.casefold() for state in states))
+            self.assertTrue(any("já está conectada" in state.casefold() for state in states))
+            pid = int(pid_file.read_text(encoding="utf-8"))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
         finally:
             coordinator.close()
 

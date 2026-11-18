@@ -39,6 +39,33 @@ AT_FDCWD = -100
 RENAME_NOREPLACE = 1
 
 
+def terminate_and_reap(process: subprocess.Popen[bytes], *, grace_seconds: float = 0.5) -> None:
+    try:
+        running = process.poll() is None
+    except Exception:
+        running = True
+    if running:
+        try:
+            process.terminate()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        process.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        process.kill()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        process.wait(timeout=grace_seconds)
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+        pass
+
+
 def _renameat2_noreplace(source: Path, destination: Path) -> None:
     try:
         libc = ctypes.CDLL(None, use_errno=True)
@@ -289,10 +316,8 @@ class BootstrapCoordinator(QObject):
                 selector.register(process.stdout, selectors.EVENT_READ)
             while process.poll() is None:
                 if self._cancel.is_set():
-                    process.terminate()
                     break
                 if time.monotonic() >= deadline:
-                    process.terminate()
                     raise BootstrapError("O login do GitHub excedeu o tempo limite.")
                 for key, _mask in selector.select(timeout=0.2):
                     chunk = os.read(key.fileobj.fileno(), 4096)
@@ -308,16 +333,12 @@ class BootstrapCoordinator(QObject):
                         safe_progress = sanitize_output(line.decode("utf-8", "replace")).strip()
                         if safe_progress:
                             self.progressChanged.emit(safe_progress[-500:])
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
             if pending:
                 safe_progress = sanitize_output(pending.decode("utf-8", "replace")).strip()
                 if safe_progress:
                     self.progressChanged.emit(safe_progress[-500:])
         finally:
+            terminate_and_reap(process)
             selector.close()
             if process.stdout is not None:
                 process.stdout.close()

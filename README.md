@@ -68,7 +68,7 @@ O aplicativo usa uma fila FIFO única em uma thread dedicada; a interface não e
 - numa instalação nova, o app clona em diretório temporário privado, rejeita links e arquivos especiais, normaliza diretórios para 0700 e arquivos para 0600, valida branch, remoto, privacidade, estrutura e Markdown e publica com `renameat2(RENAME_NOREPLACE)`; sem suporte do kernel, falha fechado;
 - uma pasta de destino já existente nunca é substituída; login cancelado, conta errada ou repositório inacessível preservam o conteúdo local;
 - “Desconectar do aplicativo” desativa somente a integração local e não executa `gh auth logout`;
-- o GitHub CLI é consultado apenas com `gh auth status`; tokens e arquivos de credenciais não são lidos.
+- o `gh` é usado somente para `auth status`, login oficial `auth login --web`, consulta `repo view` de proprietário/privacidade e o helper controlado `gh auth git-credential`; `gh auth token` e `hosts.yml` nunca são lidos. A clonagem assistida usa o executável Git com URL fixa do repositório existente.
 
 O botão **Sincronizar** executa a atualização manual. A barra informa: Sincronizado, Sincronizando, Alterações locais, Envio pendente, Offline, Login necessário, Conflito precisa de atenção ou Erro dados locais salvos.
 
@@ -91,5 +91,5 @@ O utilitário `scripts/migrate_title_filenames.py` primeiro planeja todos os nom
 
 ## Limites atuais
 
-Não há login web, clonagem assistida para outro computador, anexos, exclusão de cartões nem resolução visual de conflitos. A prévia não abre links nem carrega imagens remotas. O futuro inicializador de projetos e a futura orquestração Codex/Claude Code serão componentes separados e não fazem parte deste aplicativo neste momento.
+Não há anexos, exclusão de cartões nem resolução visual de conflitos. A prévia não abre links nem carrega imagens remotas. O futuro inicializador de projetos e a futura orquestração Codex/Claude Code serão componentes separados e não fazem parte deste aplicativo neste momento.
 
