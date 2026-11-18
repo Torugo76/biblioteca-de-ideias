@@ -300,7 +300,9 @@ class GitService:
             identity_options += ("-c", f"credential.helper=!{gh} auth git-credential")
         ssh = shutil.which("ssh", path=self._environment()["PATH"])
         if ssh:
-            identity_options += ("-c", f"core.sshCommand={ssh}")
+            identity_options += (
+                "-c", f"core.sshCommand={ssh} -F /dev/null -o BatchMode=yes",
+            )
         return self.run((*identity_options, *tuple(args)), timeout=timeout)
 
     @contextmanager

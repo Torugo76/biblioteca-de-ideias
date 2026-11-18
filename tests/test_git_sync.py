@@ -489,7 +489,9 @@ class GitServiceSafetyTest(unittest.TestCase):
         joined = "\0".join(command)
         self.assertIn("credential.helper=", command)
         self.assertIn("credential.helper=!/usr/bin/gh auth git-credential", command)
-        self.assertIn("core.sshCommand=/usr/bin/ssh", command)
+        self.assertIn("core.sshCommand=/usr/bin/ssh -F /dev/null -o BatchMode=yes", command)
+        self.assertNotIn("StrictHostKeyChecking=no", joined)
+        self.assertNotIn("UserKnownHostsFile=/dev/null", joined)
         self.assertIn(f"url.{approved}.insteadOf={approved}", joined)
 
     def test_automatic_commit_uses_fixed_noreply_identity_without_global_config(self) -> None:
@@ -830,6 +832,46 @@ class GitServiceSafetyTest(unittest.TestCase):
             for key in contaminated:
                 self.assertNotIn(key, environment)
             self.assertIn("HOME", environment)
+
+    def test_ssh_ignores_user_config_and_preserves_agent_and_known_hosts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            ssh_dir = home / ".ssh"
+            ssh_dir.mkdir(parents=True)
+            marker = root / "executed"
+            wrapper = root / "wrapper.sh"
+            wrapper.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n", encoding="utf-8")
+            wrapper.chmod(0o755)
+            (ssh_dir / "config").write_text(
+                "Host *\n"
+                f"    ProxyCommand {wrapper}\n"
+                f"    LocalCommand {wrapper}\n"
+                "    PermitLocalCommand yes\n"
+                "    HostName redirecionado.invalid\n"
+                f"Match exec \"{wrapper}\"\n"
+                "    User atacante\n",
+                encoding="utf-8",
+            )
+            (ssh_dir / "known_hosts").write_text("", encoding="utf-8")
+            fake_agent = str(root / "agent.sock")
+            service = GitService(root, timeout=2)
+            target = "ssh://git@127.0.0.1:1/repositorio.git"
+            with patch.dict(os.environ, {"HOME": str(home), "SSH_AUTH_SOCK": fake_agent}):
+                result = service._run_network(target, ("ls-remote", target), timeout=2)
+                environment = service._environment()
+                ssh_config = subprocess.run(
+                    ["/usr/bin/ssh", "-G", "-F", "/dev/null", "github.com"],
+                    env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, check=False, shell=False,
+                )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(marker.exists())
+            self.assertEqual(environment.get("SSH_AUTH_SOCK"), fake_agent)
+            resolved = ssh_config.stdout.decode("utf-8", "replace").casefold()
+            self.assertIn("userknownhostsfile", resolved)
+            self.assertIn(".ssh/known_hosts", resolved)
+            self.assertNotIn("redirecionado.invalid", resolved)
 
     def test_local_executable_helpers_are_rejected_without_running(self) -> None:
         unsafe_entries = (

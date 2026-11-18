@@ -57,7 +57,7 @@ O aplicativo usa uma fila FIFO única em uma thread dedicada; a interface não e
 - atualização remota ocorre somente por fast-forward;
 - antes de rede, a URL de fetch e o único destino efetivo de push de `origin` precisam apontar exatamente para o cofre privado oficial na branch `main`, confirmados por metadados do GitHub CLI; a operação usa diretamente um snapshot imutável dessas URLs aprovadas, nunca o nome mutável do remoto;
 - configurações Git system/global são isoladas; regras locais `insteadOf`, `pushInsteadOf` e includes são recusadas, e a configuração local permanece bloqueada durante a operação para impedir redirecionamentos concorrentes feitos pelas ferramentas normais do Git;
-- Git e GitHub CLI rodam com ambiente mínimo, sem comandos SSH/askpass/proxy/editor/diff/filtro herdados; autenticação HTTPS usa somente o helper do `gh` resolvido e SSH usa o executável do sistema com o socket do agente;
+- Git e GitHub CLI rodam com ambiente mínimo, sem comandos SSH/askpass/proxy/editor/diff/filtro herdados; autenticação HTTPS usa somente o helper do `gh` resolvido e SSH usa `/usr/bin/ssh -F /dev/null -o BatchMode=yes` com o socket do agente e `known_hosts` normais, ignorando `~/.ssh/config` sem desativar a verificação de host;
 - o avanço revalida status/index e locks do índice/referência, então usa `merge --ff-only` com `merge.autoStash=false`; esse comando apenas move a referência em fast-forward, nunca cria commit de merge nem resolve divergências;
 - divergências nunca são combinadas: o único `merge` permitido é `--ff-only`, sem commit de merge, autostash ou resolução automática; rebase, reset e force-push são proibidos;
 - falta de rede mantém o commit local como envio pendente;
