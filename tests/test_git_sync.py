@@ -565,6 +565,94 @@ class GitServiceSafetyTest(unittest.TestCase):
             self.assertEqual(service.push().returncode, 125)
             self.assertEqual(metadata.call_count, 1)
 
+    def test_push_uses_immutable_validated_url_if_origin_changes_before_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            approved = root / "approved.git"
+            false_remote = root / "false.git"
+            repo = root / "repo"
+            git(root, "init", "--bare", "--initial-branch=main", str(approved))
+            git(root, "init", "--bare", "--initial-branch=main", str(false_remote))
+            git(root, "clone", str(approved), str(repo))
+            git(repo, "config", "user.name", "Teste")
+            git(repo, "config", "user.email", "teste@example.invalid")
+            (repo / "ideia.md").write_text("segura\n", encoding="utf-8")
+            git(repo, "add", "--", "ideia.md")
+            git(repo, "commit", "-m", "segura")
+
+            class SwappingPushService(GitService):
+                swapped = False
+
+                def run(inner_self, args, timeout=None):
+                    if args and args[0] == "push" and not inner_self.swapped:
+                        inner_self.swapped = True
+                        git(repo, "remote", "set-url", "--add", "--push", "origin", false_remote.as_uri())
+                    return super().run(args, timeout)
+
+            service = SwappingPushService(repo, destination_validator=lambda: True)
+            result = service.push()
+            self.assertEqual(result.returncode, 0)
+            self.assertTrue(service.swapped)
+            self.assertEqual(
+                git(approved, "rev-parse", "refs/heads/main"),
+                git(repo, "rev-parse", "HEAD"),
+            )
+            false_ref = subprocess.run(
+                ["git", "rev-parse", "--verify", "refs/heads/main"],
+                cwd=false_remote, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                check=False, shell=False,
+            )
+            self.assertNotEqual(false_ref.returncode, 0)
+
+    def test_fetch_uses_immutable_validated_url_if_origin_changes_before_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            approved = root / "approved.git"
+            false_remote = root / "false.git"
+            seed = root / "seed"
+            repo = root / "repo"
+            git(root, "init", "--bare", "--initial-branch=main", str(approved))
+            git(root, "init", "--bare", "--initial-branch=main", str(false_remote))
+            git(root, "clone", str(approved), str(seed))
+            git(seed, "config", "user.name", "Teste")
+            git(seed, "config", "user.email", "teste@example.invalid")
+            (seed / "remota.md").write_text("oficial\n", encoding="utf-8")
+            git(seed, "add", "--", "remota.md")
+            git(seed, "commit", "-m", "oficial")
+            git(seed, "push", "origin", "main")
+            git(root, "clone", "--branch", "main", str(approved), str(repo))
+            approved_head = git(approved, "rev-parse", "refs/heads/main")
+
+            class SwappingFetchService(GitService):
+                swapped = False
+
+                def run(inner_self, args, timeout=None):
+                    if args and args[0] == "fetch" and not inner_self.swapped:
+                        inner_self.swapped = True
+                        git(repo, "remote", "set-url", "origin", false_remote.as_uri())
+                    return super().run(args, timeout)
+
+            service = SwappingFetchService(repo, destination_validator=lambda: True)
+            result = service.fetch()
+            self.assertEqual(result.returncode, 0)
+            self.assertTrue(service.swapped)
+            self.assertEqual(git(repo, "rev-parse", "origin/main"), approved_head)
+
+    @patch("biblioteca_ideias.git_sync.validate_github_repository_metadata", return_value=True)
+    def test_validated_snapshot_contains_only_approved_urls(self, _metadata) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git(repo, "init", "--initial-branch=main")
+            official = "https://github.com/Torugo76/biblioteca-de-ideias-cofre.git"
+            git(repo, "remote", "add", "origin", official)
+            destination = GitService(repo).validate_destination()
+            self.assertIsNotNone(destination)
+            assert destination is not None
+            self.assertEqual(destination.fetch_url, official)
+            self.assertEqual(destination.push_url, official)
+            self.assertNotIn("@github.com", destination.fetch_url)
+            self.assertNotIn("@github.com", destination.push_url)
+
     @patch("biblioteca_ideias.git_sync.validate_github_repository_metadata", return_value=True)
     def test_destination_validation_rejects_userinfo_and_non_main_branch(self, _metadata) -> None:
         with tempfile.TemporaryDirectory() as temporary:

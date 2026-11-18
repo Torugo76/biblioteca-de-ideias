@@ -54,6 +54,15 @@ class CommandResult:
     stderr: str
 
 
+@dataclass(frozen=True)
+class ValidatedDestination:
+    fetch_url: str
+    push_url: str
+    branch: str = "main"
+    repository: str = EXPECTED_REPOSITORY
+    visibility: str = "PRIVATE"
+
+
 def sanitize_output(value: str) -> str:
     without_credentials = GITHUB_TOKEN_PATTERN.sub("[credencial removida]", value)
 
@@ -90,7 +99,7 @@ class GitService:
         self.timeout = timeout
         self.git = shutil.which("git")
         self._destination_validator = destination_validator
-        self._validated_destination: tuple[str, str] | None = None
+        self._validated_destination: ValidatedDestination | None = None
 
     def _environment(self) -> dict[str, str]:
         environment = os.environ.copy()
@@ -159,9 +168,16 @@ class GitService:
         return any(True for _ in records)
 
     def fetch(self) -> CommandResult:
-        if not self.validate_destination():
+        destination = self.validate_destination()
+        if destination is None:
             return CommandResult(125, "", "destino remoto não validado")
-        return self.run(("fetch", "--no-tags", "origin", "main"), timeout=max(self.timeout, 30))
+        return self.run(
+            (
+                "fetch", "--no-tags", destination.fetch_url,
+                f"+refs/heads/{destination.branch}:refs/remotes/origin/{destination.branch}",
+            ),
+            timeout=max(self.timeout, 30),
+        )
 
     def ref(self, name: str) -> str | None:
         result = self.run(("rev-parse", "--verify", name))
@@ -203,13 +219,27 @@ class GitService:
         return False
 
     def push(self) -> CommandResult:
-        if not self.validate_destination():
+        destination = self.validate_destination()
+        if destination is None:
             return CommandResult(125, "", "destino remoto não validado")
-        return self.run(("push", "origin", "HEAD:main"), timeout=max(self.timeout, 30))
+        return self.run(
+            ("push", destination.push_url, f"HEAD:refs/heads/{destination.branch}"),
+            timeout=max(self.timeout, 30),
+        )
 
-    def validate_destination(self) -> bool:
+    def validate_destination(self) -> ValidatedDestination | None:
         if self._destination_validator is not None:
-            return bool(self._destination_validator())
+            if not self._destination_validator():
+                return None
+            return self._capture_destination(require_official=False, verify_metadata=False)
+        return self._capture_destination(require_official=True, verify_metadata=True)
+
+    def _capture_destination(
+        self,
+        *,
+        require_official: bool,
+        verify_metadata: bool,
+    ) -> ValidatedDestination | None:
         branch = self.run(("symbolic-ref", "--quiet", "--short", "HEAD"))
         fetch_origin = self.run(("remote", "get-url", "origin"))
         push_origins = self.run(("remote", "get-url", "--push", "--all", "origin"))
@@ -220,24 +250,24 @@ class GitService:
             or push_origins.returncode != 0
         ):
             self._validated_destination = None
-            return False
+            return None
         fetch_url = fetch_origin.stdout.strip()
         push_urls = [url.strip() for url in push_origins.stdout.splitlines() if url.strip()]
         if (
-            fetch_url not in OFFICIAL_ORIGINS
-            or len(push_urls) != 1
-            or push_urls[0] not in OFFICIAL_ORIGINS
+            len(push_urls) != 1
+            or (require_official and fetch_url not in OFFICIAL_ORIGINS)
+            or (require_official and push_urls[0] not in OFFICIAL_ORIGINS)
         ):
             self._validated_destination = None
-            return False
-        destination = (fetch_url, push_urls[0])
+            return None
+        destination = ValidatedDestination(fetch_url=fetch_url, push_url=push_urls[0])
         if self._validated_destination == destination:
-            return True
-        if not validate_github_repository_metadata():
+            return destination
+        if verify_metadata and not validate_github_repository_metadata():
             self._validated_destination = None
-            return False
+            return None
         self._validated_destination = destination
-        return True
+        return destination
 
     def add_exact(self, relative_paths: Iterable[str]) -> CommandResult:
         paths = tuple(dict.fromkeys(relative_paths))
