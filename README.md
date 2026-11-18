@@ -66,6 +66,8 @@ O aplicativo usa uma fila FIFO única em uma thread dedicada; a interface não e
 - divergências nunca são decididas automaticamente: primeiro são criadas refs locais e cópias privadas de recuperação, e o conteúdo é comparado por UUID diretamente nas árvores Git, inclusive após renomear ou mover uma ideia;
 - somente depois de escolhas explícitas para todas as ideias o aplicativo monta um commit de reconciliação em índice temporário, com os dois ancestrais; rebase, reset, checkout destrutivo e force-push são proibidos;
 - antes de aplicar e enviar a reconciliação, o aplicativo confirma que checkout e GitHub continuam nos commits analisados; uma mudança concorrente interrompe a operação e preserva escolhas e backups;
+- o Markdown resultante é serializado pelo mesmo contrato do armazenamento e validado integralmente antes de criar objetos ou commits; o limite de 2 MB inclui front matter e corpo;
+- imediatamente antes de aplicar e novamente antes de enviar, HEAD, `origin/main`, status completo (incluindo staged, unstaged e não rastreados), locks, configuração e o snapshot do remoto são revalidados;
 - falta de rede mantém o commit local como envio pendente;
 - falhas de Git não desfazem o Markdown salvo localmente;
 - falha de commit remove do índice somente os caminhos adicionados pela operação, sem tocar no worktree ou em staged externo;

@@ -12,7 +12,10 @@ from pathlib import Path
 
 import yaml
 
-from .git_sync import GitService, resolve_system_executable, safe_subprocess_environment, sanitize_output
+from .git_sync import (
+    GitService, ValidatedDestination, resolve_system_executable,
+    safe_subprocess_environment, sanitize_output,
+)
 from .storage import (
     COLUMNS, COLUMN_KEYS, FRONT_MATTER, MAX_FILE_SIZE, MarkdownStore, StorageError,
     filename_key, title_filename,
@@ -276,6 +279,17 @@ class ConflictManager:
             if not title.strip() or status not in COLUMN_KEYS:
                 raise ConflictError("Informe título e coluna para a versão combinada.")
             title_filename(title)
+            source = (
+                self._load_snapshot_idea(directory, idea_id, "local", manifest)
+                or self._load_snapshot_idea(directory, idea_id, "remote", manifest)
+            )
+            if source is None:
+                raise ConflictError("Não há versão para combinar.")
+            candidate = MarkdownStore._serialize(
+                idea_id, title, body, source.created_at,
+                datetime.now().astimezone().isoformat(timespec="seconds"),
+            )
+            self._validate_result_bytes(candidate, f"{status}/{title_filename(title)}")
         choices = manifest.setdefault("choices", {})
         assert isinstance(choices, dict)
         choices[idea_id] = {
@@ -286,6 +300,41 @@ class ConflictManager:
             return "Escolha registrada. Ainda existem conflitos pendentes."
         self._reconcile(directory, manifest)
         return "Conflitos reconciliados e enviados com segurança."
+
+    @classmethod
+    def _validate_result_bytes(cls, data: bytes, path: str) -> SnapshotIdea:
+        if len(data) > MAX_FILE_SIZE:
+            raise ConflictError(
+                f"A versão resultante excede o limite de {MAX_FILE_SIZE // (1024 * 1024)} MB."
+            )
+        idea = cls._parse_blob(path, data)
+        if not idea.title.strip() or title_filename(idea.title) != Path(path).name:
+            raise ConflictError("A versão resultante possui título ou nome inválido.")
+        return idea
+
+    def _reconcile_hook(self, stage: str) -> None:
+        """Ponto de injeção usado somente pelos testes de concorrência."""
+
+    def _assert_repository_snapshot(
+        self, expected_head: str, expected_remote: str,
+        expected_destination: ValidatedDestination,
+    ) -> None:
+        status, records = self.service.status_records()
+        if (
+            status.returncode != 0 or records
+            or self.service.ref("HEAD") != expected_head
+            or self.service.ref("origin/main") != expected_remote
+            or self.service.has_lock_contention(ignore_config_locks=True)
+            or self.service._validated_snapshot() != expected_destination
+        ):
+            raise ConflictError("O repositório mudou durante a resolução. As cópias foram preservadas.")
+
+    def _push_locked(self, destination: ValidatedDestination):
+        return self.service._run_network(
+            destination.push_url,
+            ("push", destination.push_url, f"HEAD:refs/heads/{destination.branch}"),
+            timeout=max(self.service.timeout, 30),
+        )
 
     def _load_snapshot_idea(
         self, directory: Path, idea_id: str, side: str, manifest: dict[str, object]
@@ -306,8 +355,16 @@ class ConflictManager:
         tracked_remote = self.service.ref("origin/main")
         status, records = self.service.status_records()
         previous_result = str(manifest.get("result") or "")
+        destination = self.service.validate_destination()
+        if destination is None:
+            raise ConflictError("O destino Git não pôde ser validado; as escolhas foram preservadas.")
         if head == previous_result and tracked_remote == remote and status.returncode == 0 and not records:
-            pushed = self.service.push()
+            self._reconcile_hook("pre_retry_push")
+            with self.service._network_config_guard() as guard_error:
+                if guard_error:
+                    raise ConflictError("O repositório está ocupado; as escolhas foram preservadas.")
+                self._assert_repository_snapshot(previous_result, remote, destination)
+                pushed = self._push_locked(destination)
             if pushed.returncode != 0:
                 raise ConflictError("A resolução ficou salva localmente e o envio está pendente.")
             manifest["status"] = "resolved"
@@ -336,12 +393,13 @@ class ConflictManager:
                 if duplicate is not None:
                     copy_id = str(uuid.uuid4())
                     copy_title = duplicate.title + " (GitHub)"
+                    copy_updated = datetime.now().astimezone().isoformat(timespec="seconds")
                     data = MarkdownStore._serialize(
                         copy_id, copy_title, duplicate.body, duplicate.created_at,
-                        datetime.now().astimezone().isoformat(timespec="seconds"),
+                        copy_updated,
                     )
                     result[copy_id] = SnapshotIdea(
-                        copy_id, copy_title, duplicate.created_at, duplicate.updated_at,
+                        copy_id, copy_title, duplicate.created_at, copy_updated,
                         duplicate.status, f"{duplicate.status}/{title_filename(copy_title)}", data,
                     )
             else:
@@ -350,12 +408,13 @@ class ConflictManager:
                     raise ConflictError("Não há versão para combinar.")
                 title = str(choice["title"])
                 status_name = str(choice["status"])
+                combined_updated = datetime.now().astimezone().isoformat(timespec="seconds")
                 data = MarkdownStore._serialize(
                     idea_id, title, str(choice["body"]), source.created_at,
-                    datetime.now().astimezone().isoformat(timespec="seconds"),
+                    combined_updated,
                 )
                 selected = SnapshotIdea(
-                    idea_id, title, source.created_at, source.updated_at, status_name,
+                    idea_id, title, source.created_at, combined_updated, status_name,
                     f"{status_name}/{title_filename(title)}", data,
                 )
             if selected is None:
@@ -368,11 +427,21 @@ class ConflictManager:
                 )
 
         names: dict[str, str] = {}
+        validated_result: dict[str, SnapshotIdea] = {}
         for idea in result.values():
-            key = filename_key(Path(idea.path).name)
+            canonical_path = f"{idea.status}/{title_filename(idea.title)}"
+            canonical_data = MarkdownStore._serialize(
+                idea.idea_id, idea.title, idea.body, idea.created_at, idea.updated_at,
+            )
+            validated = self._validate_result_bytes(canonical_data, canonical_path)
+            if validated.idea_id != idea.idea_id or validated.status != idea.status:
+                raise ConflictError("A versão resultante não corresponde à ideia escolhida.")
+            key = filename_key(Path(validated.path).name)
             if key in names:
                 raise ConflictError("As escolhas produzem títulos duplicados. Renomeie uma versão combinada.")
-            names[key] = idea.idea_id
+            names[key] = validated.idea_id
+            validated_result[validated.idea_id] = validated
+        result = validated_result
 
         index = directory / "resolution.index"
         index.unlink(missing_ok=True)
@@ -417,17 +486,22 @@ class ConflictManager:
         fetched = self.service.fetch()
         if fetched.returncode != 0 or self.service.ref("origin/main") != remote:
             raise ConflictError("O GitHub mudou durante a resolução. Nada foi aplicado ao checkout.")
-        if self.service.ref("HEAD") != local:
-            raise ConflictError("O checkout local mudou durante a resolução.")
+        self._reconcile_hook("pre_apply")
         with self.service._network_config_guard() as guard_error:
             if guard_error:
                 raise ConflictError("O repositório está ocupado; as escolhas foram preservadas.")
+            self._assert_repository_snapshot(local, remote, destination)
             advanced = self.service.run(
                 ("-c", "merge.autoStash=false", "merge", "--ff-only", "--no-edit", commit)
             )
         if advanced.returncode != 0:
             raise ConflictError("Não foi possível aplicar a resolução; as cópias foram preservadas.")
-        pushed = self.service.push()
+        self._reconcile_hook("pre_push")
+        with self.service._network_config_guard() as guard_error:
+            if guard_error:
+                raise ConflictError("O repositório está ocupado; o envio ficou pendente.")
+            self._assert_repository_snapshot(commit, remote, destination)
+            pushed = self._push_locked(destination)
         if pushed.returncode != 0:
             raise ConflictError("A resolução ficou salva localmente e o envio está pendente.")
         manifest["status"] = "resolved"

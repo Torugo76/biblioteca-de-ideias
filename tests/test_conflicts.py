@@ -9,7 +9,7 @@ from pathlib import Path
 
 from biblioteca_ideias.conflicts import ConflictError, ConflictManager
 from biblioteca_ideias.git_sync import CommandResult, GitService
-from biblioteca_ideias.storage import MarkdownStore
+from biblioteca_ideias.storage import MAX_FILE_SIZE, MarkdownStore
 
 
 def git(repo: Path, *args: str) -> str:
@@ -151,6 +151,80 @@ class ConflictResolutionTest(unittest.TestCase):
         git(self.other, "commit", "-m", "uuid duplicado")
         with self.assertRaises(ConflictError):
             self.manager._snapshot(git(self.other, "rev-parse", "HEAD"))
+
+    def test_combined_size_boundary_and_oversize_leave_no_result_artifacts(self) -> None:
+        local, remote = self.diverge()
+        conflict_id = self.manager.prepare(local, remote)
+        version = self.manager.version(conflict_id, self.idea_id, "local")
+        directory = self.state / conflict_id
+        manifest_before = (directory / "manifest.json").read_bytes()
+        result_ref = f"refs/recovery/conflict-{conflict_id}-result"
+        head_before = git(self.local, "rev-parse", "HEAD")
+        remote_before = git(self.bare, "rev-parse", "main")
+
+        source = self.manager._load_snapshot_idea(
+            directory, self.idea_id, "local", self.manager._manifest(conflict_id)[1]
+        )
+        assert source is not None
+        now = source.updated_at
+        empty = MarkdownStore._serialize(self.idea_id, "Limite", "", source.created_at, now)
+        boundary_body = "x" * (MAX_FILE_SIZE - len(empty))
+        boundary = MarkdownStore._serialize(
+            self.idea_id, "Limite", boundary_body, source.created_at, now
+        )
+        self.assertEqual(len(boundary), MAX_FILE_SIZE)
+        self.manager._validate_result_bytes(boundary, "entrada/Limite.md")
+
+        with self.assertRaises(ConflictError):
+            self.manager.choose(
+                conflict_id, self.idea_id, "combined", title="Grande",
+                body="x" * MAX_FILE_SIZE, status="entrada",
+            )
+        self.assertEqual((directory / "manifest.json").read_bytes(), manifest_before)
+        self.assertEqual(git(self.local, "rev-parse", "HEAD"), head_before)
+        self.assertEqual(git(self.bare, "rev-parse", "main"), remote_before)
+        self.assertFalse((directory / "resolution-files").exists())
+        missing = subprocess.run(
+            ["/usr/bin/git", "rev-parse", "--verify", result_ref], cwd=self.local,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertTrue(version["titulo"])
+
+    def test_each_pre_apply_change_aborts_without_applying_or_pushing(self) -> None:
+        mutations = ("untracked", "staged", "edited", "head", "remote-config")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                if mutation != mutations[0]:
+                    self.tearDown()
+                    self.setUp()
+                local, remote = self.diverge()
+                conflict_id = self.manager.prepare(local, remote)
+                remote_main = git(self.bare, "rev-parse", "main")
+
+                def inject(stage: str) -> None:
+                    if stage != "pre_apply":
+                        return
+                    if mutation == "untracked":
+                        (self.local / "concorrente.txt").write_text("novo", encoding="utf-8")
+                    elif mutation == "staged":
+                        (self.local / "staged.txt").write_text("staged", encoding="utf-8")
+                        git(self.local, "add", "staged.txt")
+                    elif mutation == "edited":
+                        path = next(self.local.glob("*/*.md"))
+                        path.write_text(path.read_text(encoding="utf-8") + "editado", encoding="utf-8")
+                    elif mutation == "head":
+                        git(self.local, "update-ref", "refs/heads/main", remote)
+                    else:
+                        git(self.local, "remote", "set-url", "origin", str(self.local.parent / "falso.git"))
+
+                self.manager._reconcile_hook = inject  # type: ignore[method-assign]
+                with self.assertRaises(ConflictError):
+                    self.manager.choose(conflict_id, self.idea_id, "local")
+                expected_head = remote if mutation == "head" else local
+                self.assertEqual(git(self.local, "rev-parse", "HEAD"), expected_head)
+                self.assertEqual(git(self.bare, "rev-parse", "main"), remote_main)
+                self.assertTrue(self.manager.list_pending())
 
 
 if __name__ == "__main__":
