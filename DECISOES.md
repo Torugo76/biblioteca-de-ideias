@@ -19,7 +19,7 @@
 - Commits automáticos usam a identidade fixa de privacidade `Biblioteca de Ideias <Torugo76@users.noreply.github.com>`; autenticação HTTPS usa exclusivamente o helper do executável `gh` resolvido. SSH usa `/usr/bin/ssh -F /dev/null -o BatchMode=yes`, preservando o agente e `known_hosts`, sem herdar `~/.ssh/config` nem desativar a verificação de host.
 - Falha de commit executa `restore --staged` somente nos pathspecs exatos da operação e nunca altera o worktree.
 - O app nunca sobrescreve silenciosamente uma edição externa.
-- O bootstrap roda antes do `MarkdownStore`: em máquina nova, o único cofre permitido é clonado do repositório privado existente para um temporário 0700, validado e movido atomicamente. Destinos existentes ou inesperados são preservados.
+- O bootstrap roda antes do `MarkdownStore`: em máquina nova, o único cofre permitido é clonado do repositório privado existente para um temporário 0700, endurecido (diretórios 0700, arquivos 0600, sem links/especiais), validado e publicado por `renameat2(RENAME_NOREPLACE)`. Destinos existentes ou concorrentes são preservados; plataformas sem a primitiva falham fechado.
 - Login usa `gh auth login --web` em worker cancelável; a interface nunca lê token ou `hosts.yml`. Desconectar afeta apenas a preferência local do aplicativo.
 - O corpo Markdown integral é canônico; trechos dos cartões são derivados sem regravar o arquivo.
 - A prévia escapa HTML, remove imagens remotas e nunca abre links automaticamente.

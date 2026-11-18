@@ -65,7 +65,7 @@ O aplicativo usa uma fila FIFO única em uma thread dedicada; a interface não e
 - falta de rede mantém o commit local como envio pendente;
 - falhas de Git não desfazem o Markdown salvo localmente;
 - falha de commit remove do índice somente os caminhos adicionados pela operação, sem tocar no worktree ou em staged externo;
-- numa instalação nova, o app clona em diretório temporário privado, valida branch, remoto, privacidade, estrutura e Markdown e só então move o cofre atomicamente ao destino XDG;
+- numa instalação nova, o app clona em diretório temporário privado, rejeita links e arquivos especiais, normaliza diretórios para 0700 e arquivos para 0600, valida branch, remoto, privacidade, estrutura e Markdown e publica com `renameat2(RENAME_NOREPLACE)`; sem suporte do kernel, falha fechado;
 - uma pasta de destino já existente nunca é substituída; login cancelado, conta errada ou repositório inacessível preservam o conteúdo local;
 - “Desconectar do aplicativo” desativa somente a integração local e não executa `gh auth logout`;
 - o GitHub CLI é consultado apenas com `gh auth status`; tokens e arquivos de credenciais não são lidos.

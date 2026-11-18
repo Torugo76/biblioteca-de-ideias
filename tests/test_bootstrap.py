@@ -12,7 +12,9 @@ from PySide6.QtCore import QCoreApplication
 from biblioteca_ideias.bootstrap import (
     BootstrapCoordinator,
     BootstrapError,
+    _renameat2_noreplace,
     clone_existing_vault,
+    harden_vault_tree,
     validate_existing_vault,
 )
 from biblioteca_ideias.storage import MarkdownStore
@@ -73,6 +75,11 @@ class BootstrapTest(unittest.TestCase):
         self.assertEqual(installed, destination)
         self.assertTrue((destination / ".git").is_dir())
         self.assertEqual(len(list(destination.rglob("*.md"))), 1)
+        for path in (destination, *destination.rglob("*")):
+            if path.is_dir():
+                self.assertEqual(path.stat().st_mode & 0o777, 0o700, path)
+            elif path.is_file():
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600, path)
         self.assertEqual(git(destination, "status", "--porcelain"), "")
         self.assertFalse(list(destination.parent.glob(".cofre-bootstrap-*")))
 
@@ -84,6 +91,77 @@ class BootstrapTest(unittest.TestCase):
         with self.assertRaises(BootstrapError):
             clone_existing_vault(destination)
         self.assertEqual(marker.read_text(encoding="utf-8"), "não apagar")
+
+    def test_all_existing_destination_types_are_preserved(self) -> None:
+        variants = ("empty-dir", "file", "symlink", "dangling-symlink")
+        for variant in variants:
+            with self.subTest(variant=variant):
+                destination = self.root / f"destino-{variant}"
+                if variant == "empty-dir":
+                    destination.mkdir()
+                elif variant == "file":
+                    destination.write_text("preservar", encoding="utf-8")
+                elif variant == "symlink":
+                    target = self.root / f"alvo-{variant}"
+                    target.mkdir()
+                    destination.symlink_to(target, target_is_directory=True)
+                else:
+                    destination.symlink_to(self.root / "alvo-ausente", target_is_directory=True)
+                before_link = os.readlink(destination) if destination.is_symlink() else None
+                with self.assertRaises(BootstrapError):
+                    clone_existing_vault(destination)
+                self.assertTrue(os.path.lexists(destination))
+                if before_link is not None:
+                    self.assertEqual(os.readlink(destination), before_link)
+
+    def test_atomic_publish_refuses_destination_created_at_syscall(self) -> None:
+        destination = self.root / "corrida" / "cofre"
+        original_rename = _renameat2_noreplace
+
+        def create_destination_then_publish(source: Path, target: Path) -> None:
+            target.mkdir()
+            (target / "concorrente.txt").write_text("preservar", encoding="utf-8")
+            original_rename(source, target)
+
+        patches = self.clone_patches()
+        for item in patches:
+            item.start()
+        try:
+            with patch(
+                "biblioteca_ideias.bootstrap._renameat2_noreplace",
+                side_effect=create_destination_then_publish,
+            ):
+                with self.assertRaises(BootstrapError):
+                    clone_existing_vault(destination)
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        self.assertEqual((destination / "concorrente.txt").read_text(encoding="utf-8"), "preservar")
+        self.assertFalse((destination / ".git").exists())
+        self.assertFalse(list(destination.parent.glob(".cofre-bootstrap-*")))
+
+    def test_publish_fails_closed_without_renameat2(self) -> None:
+        source = self.root / "origem"
+        destination = self.root / "destino-sem-syscall"
+        source.mkdir()
+        with patch("biblioteca_ideias.bootstrap.ctypes.CDLL", side_effect=AttributeError):
+            with self.assertRaisesRegex(BootstrapError, "instalação atômica"):
+                _renameat2_noreplace(source, destination)
+        self.assertTrue(source.exists())
+        self.assertFalse(destination.exists())
+
+    def test_hardening_rejects_symlinks_and_special_files(self) -> None:
+        symlink_root = self.root / "com-link"
+        symlink_root.mkdir()
+        (symlink_root / "link").symlink_to(self.root / "fora")
+        with self.assertRaisesRegex(BootstrapError, "link simbólico"):
+            harden_vault_tree(symlink_root)
+
+        special_root = self.root / "especial"
+        special_root.mkdir()
+        os.mkfifo(special_root / "fifo")
+        with self.assertRaisesRegex(BootstrapError, "arquivo especial"):
+            harden_vault_tree(special_root)
 
     def test_invalid_clone_is_rejected_before_atomic_move(self) -> None:
         bad_remote = self.root / "bad.git"

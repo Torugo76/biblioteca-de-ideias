@@ -3,11 +3,14 @@ from __future__ import annotations
 import os
 import queue
 import selectors
+import stat
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
+import ctypes
+import errno
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
@@ -30,6 +33,70 @@ OFFICIAL_CLONE_URL = "https://github.com/Torugo76/biblioteca-de-ideias-cofre.git
 
 class BootstrapError(RuntimeError):
     pass
+
+
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
+
+
+def _renameat2_noreplace(source: Path, destination: Path) -> None:
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+    except (OSError, AttributeError) as exc:
+        raise BootstrapError("Este sistema não oferece instalação atômica segura para o cofre.") from exc
+    renameat2.argtypes = (
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        AT_FDCWD, os.fsencode(source), AT_FDCWD, os.fsencode(destination), RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error in (errno.EEXIST, errno.ENOTEMPTY, errno.ENOTDIR, errno.EISDIR):
+        raise BootstrapError("O destino do cofre já existe. Nada foi sobrescrito.")
+    if error in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
+        raise BootstrapError("Este sistema não oferece instalação atômica segura para o cofre.")
+    raise BootstrapError("Não foi possível instalar o cofre com segurança. Nada foi sobrescrito.")
+
+
+def harden_vault_tree(root: Path) -> None:
+    if root.is_symlink() or not root.is_dir():
+        raise BootstrapError("A árvore do cofre contém um caminho inválido.")
+    directories: list[Path] = [root]
+    files: list[Path] = []
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            raise BootstrapError("Não foi possível validar a árvore privada do cofre.") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise BootstrapError("Não foi possível validar a árvore privada do cofre.") from exc
+            mode = metadata.st_mode
+            if stat.S_ISLNK(mode):
+                raise BootstrapError("O cofre contém link simbólico e não pode ser instalado.")
+            if stat.S_ISDIR(mode):
+                directories.append(path)
+                pending.append(path)
+            elif stat.S_ISREG(mode):
+                files.append(path)
+            else:
+                raise BootstrapError("O cofre contém arquivo especial e não pode ser instalado.")
+    try:
+        for directory in directories:
+            directory.chmod(0o700)
+        for file_path in files:
+            file_path.chmod(0o600)
+    except OSError as exc:
+        raise BootstrapError("Não foi possível aplicar permissões privadas ao cofre.") from exc
 
 
 def validate_existing_vault(vault: Path, *, require_remote_metadata: bool = False) -> None:
@@ -70,7 +137,7 @@ def validate_existing_vault(vault: Path, *, require_remote_metadata: bool = Fals
 
 
 def clone_existing_vault(vault: Path) -> Path:
-    if vault.exists():
+    if os.path.lexists(vault):
         raise BootstrapError("Já existe conteúdo no destino do cofre. Nada foi sobrescrito.")
     authenticated, username = detect_github_cli()
     if not authenticated:
@@ -115,10 +182,10 @@ def clone_existing_vault(vault: Path) -> Path:
         )
         if completed.returncode != 0:
             raise BootstrapError("Não foi possível baixar o cofre privado. Seus dados locais não foram alterados.")
+        harden_vault_tree(candidate)
         validate_existing_vault(candidate, require_remote_metadata=True)
-        if vault.exists():
-            raise BootstrapError("O destino passou a existir durante a instalação. Nada foi sobrescrito.")
-        os.replace(candidate, vault)
+        harden_vault_tree(candidate)
+        _renameat2_noreplace(candidate, vault)
         return vault
     except subprocess.TimeoutExpired as exc:
         raise BootstrapError("O download do cofre excedeu o tempo limite.") from exc
